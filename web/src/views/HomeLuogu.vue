@@ -1,0 +1,2271 @@
+<script setup lang="ts">
+// 经典「洛谷风格」首页（广告轮播 + 打卡/运势卡 + 犇犇 + 训练题单……），
+// 从云图改版前的版本原样保留：主题商店开「洛谷风格主页」时由 Home.vue 分发到这。
+// 新版云图首页在 HomeCloud.vue；两套布局互不影响顶栏公告 / 犇犇浮窗等新功能。
+import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
+import { useRouter } from 'vue-router'
+import { useAuthStore } from '@/stores/auth'
+import apiClient from '@/api/client'
+import { trainingsApi, type TrainingListItem } from '@/api/trainings'
+import { userNameColor } from '@/utils/userColor'
+import { getUserTagDisplay } from '@/utils/userTag'
+import { useAcademicMode } from '@/utils/academicMode'
+import UserAvatarStatus from '@/components/UserAvatarStatus.vue'
+import BenbenMarkdownEditor from '@/components/BenbenMarkdownEditor.vue'
+
+const router = useRouter()
+const authStore = useAuthStore()
+
+// 学术模式：开启后隐藏犇犇模块
+const { academicMode } = useAcademicMode()
+
+const isLoggedIn = computed(() => authStore.isAuthenticated)
+const currentUser = computed(() => authStore.currentUser)
+
+// ==================== 首页广告轮播 ====================
+
+type CarouselAd = {
+  image: string
+  link: string
+}
+
+const DEFAULT_ADS: CarouselAd[] = [{ image: '/white.png', link: '/' }]
+
+const adItems = ref<CarouselAd[]>([...DEFAULT_ADS])
+const currentAdIndex = ref(0)
+
+async function loadHomeAds(): Promise<void> {
+  try {
+    const data: any = await apiClient.get('/api/home-ads')
+    const ads = Array.isArray(data?.ads) ? data.ads : []
+    adItems.value = ads.length
+      ? ads.map((item: any) => ({ image: item.image, link: item.link }))
+      : [...DEFAULT_ADS]
+    currentAdIndex.value = 0
+  } catch {
+    adItems.value = [...DEFAULT_ADS]
+  }
+}
+
+const cycleAdForward = () => {
+  if (adItems.value.length <= 1) return
+  currentAdIndex.value = (currentAdIndex.value + 1) % adItems.value.length
+}
+
+const cycleAdBackward = () => {
+  if (adItems.value.length <= 1) return
+  currentAdIndex.value = (currentAdIndex.value - 1 + adItems.value.length) % adItems.value.length
+}
+
+const goAd = (target: string) => {
+  if (!target) return
+  if (/^https?:\/\//.test(target)) {
+    window.open(target, '_blank', 'noopener,noreferrer')
+    return
+  }
+  router.push(target)
+}
+
+// ==================== 通用工具 ====================
+
+const COLOR_RED = 'var(--primary)'
+const COLOR_PURPLE = '#9C3DCF'
+const COLOR_BROWN = '#AD8B00'
+
+// 获取用户显示颜色
+const getUserDisplayColor = (user: any) => userNameColor(user)
+
+
+// 生成字母头像
+const letterAvatar = (name: string) => {
+  const ch = (name || 'U').trim().charAt(0).toUpperCase() || 'U'
+  return `data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' fill='%23e74c3c'/%3E%3Ctext x='50%25' y='50%25' text-anchor='middle' dy='.3em' fill='white' font-size='16' font-family='Arial'%3E${encodeURIComponent(ch)}%3C/text%3E%3C/svg%3E`
+}
+
+const getUserAvatar = (item: any) => {
+  return item.avatar_url || letterAvatar(item.username)
+}
+
+// 富文本渲染（Markdown + LaTeX 公式）
+import { renderRichText as renderMarkdown } from '@/utils/markdown'
+
+// ==================== 打卡（服务端存储，跨设备一致） ====================
+
+// 打卡状态来自后端（users 表），换设备 / 重装 / 清缓存不丢失
+const checkinState = ref({ today_checked: false, streak: 0, total: 0 })
+
+const loadCheckin = async () => {
+  if (!isLoggedIn.value) return
+  try {
+    checkinState.value = await apiClient.get('/api/checkin')
+  } catch {
+    // 静默失败：保持当前状态，不影响页面其余模块
+  }
+}
+
+// 随机种子（splitmix32）
+function splitmix32(seed: number) {
+  seed = seed >>> 0
+  return function () {
+    seed = (seed + 0x9E3779B9) >>> 0
+    let z = seed
+    z = ((z ^ (z >>> 16)) * 0x85EBCA6B) >>> 0
+    z = ((z ^ (z >>> 13)) * 0xC2B2AE35) >>> 0
+    z = (z ^ (z >>> 16)) >>> 0
+    return (z >>> 0) / 4294967296
+  }
+}
+
+function getDailySeed(userId: string) {
+  const today = getTodayDateStr()
+  const base = String(userId || 'anonymous')
+  const salt = '✨NLNOJ🏮'
+  const combined = base + today + salt
+  let hash = 5381
+  for (let i = 0; i < combined.length; i++) {
+    hash = ((hash << 5) + hash) + combined.charCodeAt(i)
+    hash |= 0
+  }
+  const dateNum = parseInt(today.replace(/-/g, ''))
+  hash = ((hash >>> 0) ^ dateNum * 2654435761) >>> 0
+  return Math.abs(hash) >>> 0
+}
+
+// 日期工具（时区为东八区）
+function getTodayDateStr() {
+  const now = new Date()
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).format(now)
+}
+
+const getChineseWeekday = (date: Date) => {
+  const weekdays = ['星期日', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六']
+  return weekdays[date.getDay()]
+}
+
+const getMonthSize = (date: Date) => {
+  const year = date.getFullYear()
+  const month = date.getMonth()
+  const daysInMonth = new Date(year, month + 1, 0).getDate()
+  return daysInMonth >= 30 ? '大' : '小'
+}
+
+const getMonthChinese = (date: Date) => {
+  const months = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十', '十一', '十二']
+  return months[date.getMonth()] + '月'
+}
+
+const daysUntil = (targetDate: Date) => {
+  const now = new Date()
+  now.setHours(0, 0, 0, 0)
+  const target = new Date(targetDate)
+  target.setHours(0, 0, 0, 0)
+  const diff = target.getTime() - now.getTime()
+  return Math.ceil(diff / (1000 * 60 * 60 * 24))
+}
+
+// 当前时间（每分钟刷新一次，保证跨天正确）
+const now = ref(new Date())
+let clockTimer: number | null = null
+
+const dayStr = computed(() => String(now.value.getDate()).padStart(2, '0'))
+const weekday = computed(() => getChineseWeekday(now.value))
+const monthChineseFull = computed(() => getMonthChinese(now.value) + getMonthSize(now.value))
+const cspDays1 = computed(() => daysUntil(new Date(2026, 8, 19)))
+const cspDays2 = computed(() => daysUntil(new Date(2026, 9, 30)))
+
+// 倒计时文案：当天显示「就是今天」，过期显示「已结束」
+const cspCountdownLabel = (days: number) => {
+  if (days === 0) return '就是今天！'
+  if (days < 0) return '已结束'
+  return `还剩 ${days} 天`
+}
+const cspLabel1 = computed(() => cspCountdownLabel(cspDays1.value))
+const cspLabel2 = computed(() => cspCountdownLabel(cspDays2.value))
+
+// 今日是否已打卡 / 连续打卡天数（均为服务端状态）
+const checkedInToday = computed(() => checkinState.value.today_checked)
+const streakDays = computed(() => checkinState.value.streak)
+
+// ===== 运势 =====
+const ACTIVITIES = [
+  { name: '写作文', good: '非常有文采', bad: '不知所云，离题千里' },
+  { name: '写洛谷日报', good: '文思泉涌，下笔如有神', bad: '发现还差得远' },
+  { name: '放假', good: '自由自在的一个假期', bad: '就放一天，全是作业' },
+  { name: '玩网游', good: '犹如神助', bad: '匹配到一群猪队友' },
+  { name: '考试', good: '学的全会，蒙的全对', bad: '作弊会被抓' },
+  { name: '背诵课文', good: '看一遍就背下来了', bad: '记忆力只有 50 Byte' },
+  { name: '交友', good: '友谊地久天长', bad: '交友不慎' },
+  { name: '骗分', good: '"不可以，总司令"然后拿一半分', bad: '一分不得' },
+  { name: '抽卡', good: '一发入魂', bad: '只有保底' },
+  { name: '贴贴', good: '说不定擦出火花', bad: '一定会被拒绝' },
+  { name: '出公开赛', good: 'rated，评价很高', bad: '出了原题裸题错题不可做题' },
+  { name: '开电脑', good: '电脑的状态也很好', bad: '意外的死机故障不可避' },
+  { name: '祭祀', good: '获得祖宗的庇护', bad: '未能得到祖宗保佑' },
+  { name: '体育锻炼', good: '身体棒棒哒', bad: '消耗的能量全吃回来了' },
+  { name: '网购', good: '买到历史最低价', bad: '正好错过促销' },
+  { name: '摸鱼', good: '放松身心', bad: '被教练制裁' },
+  { name: '请教问题', good: '获得大佬的解答', bad: '被当作 xxs' },
+  { name: '抢最优解', good: '一发就是最优解', bad: '越卡常越慢' },
+  { name: '洗澡', good: '洗香香', bad: '小心着凉' },
+  { name: '唱歌', good: '成为歌神', bad: '别人唱歌要钱，你要命' },
+  { name: '玩我的世界', good: '下界挖到远古遗骸', bad: '转角遇到苦力怕' },
+  { name: '熬夜', good: '事情终究可以完成的', bad: '爆肝，通宵干不完' },
+  { name: '写暴戾语言', good: '成功发泄', bad: '禁赛一年' },
+  { name: '卷题', good: '水平显著提升', bad: '我咋啥都不会' },
+  { name: '上洛谷', good: '全方位提升', bad: '你谷日爆' },
+  { name: '出行', good: '一路顺风', bad: '路途也许坎坷' },
+  { name: '点外卖', good: '及时送到', bad: '一直没有送到还不给退款' },
+  { name: '写题解', good: '一遍通过审核', bad: '连续提交不符合要求' },
+  { name: '学新算法', good: '看一遍就懂了', bad: '怎么也学不会' },
+  { name: '重构代码', good: '代码质量明显提高', bad: '越改越乱' },
+  { name: '继续完成 WA 的题', good: '下一次就 AC', bad: '然而变成了 TLE' },
+  { name: '打线上公开赛', good: '涨很多 rating', bad: '掉大分' },
+  { name: '参加模拟赛', good: '可以 AK 虐全场', bad: '注意爆零' },
+  { name: '水讨论区', good: '看到有趣的事情', bad: '和其他人激情对线' },
+  { name: '写作业', good: '都会写，写的全对', bad: '上课讲了这些了吗' },
+  { name: '装弱', good: '谦虚最好了', bad: '被看穿' },
+  { name: '看视频网站', good: '愉悦身心', bad: '会被教练看见' },
+  { name: '刷题', good: '成为虐题狂魔', bad: '容易 WA' },
+  { name: '装逼', good: '获得众人敬仰', bad: '被识破' },
+  { name: '睡觉', good: '养足精力，明日再战', bad: '翻来覆去睡不着' },
+  { name: '切水题', good: '通过数猛涨', bad: '被抓抄题解' },
+  { name: '膜拜大神', good: '接受神犇光环照耀', bad: '被大神鄙视' },
+  { name: '吃饭', good: '人是铁饭是钢', bad: '小心变胖啊' },
+  { name: '上厕所', good: '想出了题目的解法', bad: '被机房惨案' },
+  { name: '打东方', good: 'All clear！', bad: '满身疮痍' },
+  { name: '造数据', good: '严谨数据，经久耐用', bad: '数据出锅，当众谢罪' },
+  { name: '纳财', good: '要到好多 Money', bad: '然而今天并没有财运' },
+  { name: '去食堂', good: '给了双倍的量', bad: '爱吃的菜刚被打完' },
+  { name: '上课', good: '100% 消化', bad: '反正你听不懂' },
+  { name: '发朋友圈', good: '分享是种美德', bad: '会被当做卖面膜的' },
+  { name: '扶老奶奶过马路', good: '增加 RP', bad: '会被讹' },
+  { name: '水工单', good: '与他人友好交流', bad: '这工单是人吗' },
+  { name: '发工单', good: '被成功采纳', bad: '喜提禁言' },
+  { name: '举报', good: '被举报的人遭受正义制裁', bad: '被管理驳回' },
+  { name: '看电视', good: '有你最喜欢的节目', bad: '电视瘫痪' },
+  { name: '猜猜犇', good: '都认识', bad: '都不认识' },
+  { name: '打牌', good: '一手好牌，大获全胜', bad: '一手烂牌，一败涂地' },
+  { name: '看医生', good: '医生治好了你的病', bad: '医生也看不出来你哪里有病' }
+]
+
+const FORTUNE_LEVELS = [
+  { label: '大吉', cls: 'good' },
+  { label: '中吉', cls: 'good' },
+  { label: '小吉', cls: 'good' },
+  { label: '中平', cls: 'bad' },
+  { label: '凶', cls: 'terrible' },
+  { label: '大凶', cls: 'terrible' }
+]
+
+// 特殊日运势：全员固定（键为 YYYY-MM-DD，当日人人一样）
+// 2026-09-19：CSP-J/S 第一轮认证，全员大吉，宜 CSP RP++
+const SPECIAL_FORTUNES: Record<string, { goodItems: { name: string; desc: string }[] }> = {
+  '2026-09-19': { goodItems: [{ name: 'CSP', desc: 'RP++' }] }
+}
+
+// 计算今日运势（纯前端种子算法：同人同日恒定，无需持久化）
+const dailyFortune = computed(() => {
+  if (!checkedInToday.value || !isLoggedIn.value) return null
+  // 特殊日优先：跳过随机，直接按预定的运势展示
+  const d = now.value
+  const special = SPECIAL_FORTUNES[
+    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+  ]
+  if (special) {
+    return { label: '大吉', cls: 'good', goodItems: special.goodItems, badItems: [] }
+  }
+  const userIdSeed = String(currentUser.value?.user_number || '')
+  const rand = splitmix32(getDailySeed(userIdSeed))
+  const fortuneIdx = Math.floor(rand() * FORTUNE_LEVELS.length)
+  const fortune = FORTUNE_LEVELS[fortuneIdx]
+  const shuffled = [...ACTIVITIES]
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]]
+  }
+  const picked = shuffled.slice(0, 4)
+  const goodItems = picked.slice(0, 2).map(a => ({ name: a.name, desc: a.good }))
+  const badItems = picked.slice(2, 4).map(a => ({ name: a.name, desc: a.bad }))
+  return { label: fortune.label, cls: fortune.cls, goodItems, badItems }
+})
+
+const fortuneLabel = computed(() => dailyFortune.value?.label || '')
+const fortuneClass = computed(() => {
+  const cls = dailyFortune.value?.cls
+  if (cls === 'good') return 'lg-fg-red'
+  if (cls === 'bad') return 'lg-fg-green'
+  if (cls === 'terrible') return 'lg-fg-black'
+  return 'lg-fg-green'
+})
+const fortuneColor = computed(() => {
+  const cls = dailyFortune.value?.cls
+  if (cls === 'good') return '#E74C3C'
+  if (cls === 'bad') return '#5EB95E'
+  if (cls === 'terrible') return '#000000'
+  return '#5EB95E'
+})
+const fortuneGoodItems = computed(() =>
+  dailyFortune.value?.label === '大凶' ? [] : (dailyFortune.value?.goodItems || [])
+)
+const fortuneBadItems = computed(() =>
+  dailyFortune.value?.label === '大吉' ? [] : (dailyFortune.value?.badItems || [])
+)
+
+// 点击打卡（服务端幂等：当日重复打卡直接返回现状）
+const doPunch = async () => {
+  if (!isLoggedIn.value) {
+    router.push('/login')
+    return
+  }
+  if (checkinState.value.today_checked) return
+  try {
+    checkinState.value = await apiClient.post('/api/checkin')
+  } catch (error: any) {
+    alert('打卡失败：' + (error.response?.data?.detail || error.message || '未知错误'))
+  }
+}
+
+// 当前用户的展示信息
+const meColor = computed(() => getUserDisplayColor(currentUser.value))
+const meTag = computed(() => getUserTagDisplay(currentUser.value))
+
+// ==================== 近期讨论 ====================
+const recentPosts = ref<any[]>([])
+const recentLoading = ref(false)
+const friendLinks = ref<any[]>([])
+const friendLinksLoading = ref(false)
+
+const loadFriendLinks = async () => {
+  friendLinksLoading.value = true
+  try {
+    const data: any = await apiClient.get('/api/friend-links')
+    friendLinks.value = Array.isArray(data?.links) ? data.links : []
+  } catch {
+    friendLinks.value = []
+  } finally {
+    friendLinksLoading.value = false
+  }
+}
+
+const relTime = (iso: string) => {
+  if (!iso) return ''
+  const diff = Math.floor((Date.now() - new Date(iso).getTime()) / 1000)
+  if (diff < 60) return '刚刚'
+  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`
+  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`
+  if (diff < 172800000) return `${Math.floor(diff / 86400)} 天前`
+  return new Date(iso).toLocaleDateString('zh-CN')
+}
+
+const loadRecentPosts = async () => {
+  recentLoading.value = true
+  try {
+    const data: any = await apiClient.get('/api/forum/recent?limit=10')
+    recentPosts.value = Array.isArray(data) ? data : []
+  } catch {
+    recentPosts.value = []
+  } finally {
+    recentLoading.value = false
+  }
+}
+
+// ==================== 犇犇模块 ====================
+
+const MAX_LENGTH = 454 // 普通用户最大字数限制（原 227 翻倍）
+
+const benbenContent = ref('')
+const benbenList = ref<any[]>([])
+const feedMode = ref<'all' | 'my'>('all')
+const isLoading = ref(false)
+const hasMore = ref(true)
+const lastId = ref<number | null>(null)
+const currentReplyingId = ref<number | null>(null)
+const currentReplyUsername = ref<string | null>(null)
+
+// 加载状态文案（对应原站 loadingSentinel）
+const sentinelText = ref('')
+const sentinelVisible = ref(true)
+
+const benbenTextareaRef = ref<InstanceType<typeof BenbenMarkdownEditor> | null>(null)
+const loadingSentinelRef = ref<HTMLElement | null>(null)
+
+// 是否被禁言
+const cannotSpeak = computed(() => currentUser.value?.can_speak === false)
+
+// 更新加载指示文案
+const updateSentinel = () => {
+  // 列表为空时：空状态由 benben-empty 呈现，sentinel 仅在出错时显示错误信息
+  if (benbenList.value.length === 0) {
+    sentinelVisible.value = sentinelText.value === '加载出错，请刷新'
+    return
+  }
+  if (!hasMore.value) {
+    sentinelText.value = '没有更多动态了'
+    sentinelVisible.value = true
+  } else if (isLoading.value) {
+    sentinelText.value = '加载中...'
+    sentinelVisible.value = true
+  } else {
+    sentinelText.value = '点击加载更多'
+    sentinelVisible.value = true
+  }
+}
+
+// 时间格式化（与原站一致的完整时间）
+const formatTime = (dateStr: string) => {
+  return new Date(dateStr).toLocaleString('zh-CN')
+}
+
+// 切换犇犇标签页
+const switchTab = (mode: 'all' | 'my') => {
+  feedMode.value = mode
+  currentReplyingId.value = null
+  currentReplyUsername.value = null
+  // 换列表了，攒着的新动态提示作废
+  pendingBenben.value = []
+  loadBenbenList(true)
+}
+
+// 发布犇犇（乐观更新：点击后立即上屏，失败回滚）
+const posting = ref(false)
+
+const postBenben = async () => {
+  const content = benbenContent.value.trim()
+  if (!content) {
+    alert('内容不能为空')
+    return
+  }
+
+  if (!currentUser.value) {
+    router.push('/login')
+    return
+  }
+
+  if (cannotSpeak.value) {
+    alert('你已被禁言，无法发布犇犇')
+    return
+  }
+
+  // 校验回复前缀，决定 reply_to
+  let finalReplyToId: number | null = null
+  let replyToName: string | null = null
+  if (currentReplyingId.value && currentReplyUsername.value) {
+    const trimmed = content.trimStart()
+    const prefix = `|| @${currentReplyUsername.value} :`
+    if (trimmed.startsWith(prefix)) {
+      finalReplyToId = currentReplyingId.value
+      replyToName = currentReplyUsername.value
+    } else {
+      currentReplyingId.value = null
+      currentReplyUsername.value = null
+    }
+  }
+
+  const finalContent = currentUser.value.is_admin ? content : content.substring(0, MAX_LENGTH)
+
+  posting.value = true
+
+  // 乐观插入的临时对象（服务器返回后替换为正式数据）
+  const u = currentUser.value
+  const optimisticId = -Date.now()
+  const optimistic = {
+    id: optimisticId,
+    user_number: u.user_number,
+    username: u.username,
+    avatar_url: u.avatar_url,
+    is_admin: u.is_admin,
+    is_cheater: u.is_cheater,
+    user_tag: u.user_tag,
+    content: finalContent,
+    reply_to: finalReplyToId,
+    reply_to_username: replyToName,
+    created_at: new Date().toISOString(),
+    // 同 HomeCloud：临时项少了 last_seen 就会显示成「离线」
+    last_seen: u.last_seen ?? new Date().toISOString(),
+  }
+  benbenList.value = [optimistic, ...benbenList.value]
+
+  try {
+    const res: any = await apiClient.post('/benben', {
+      content: finalContent,
+      ...(finalReplyToId ? { reply_to: finalReplyToId } : {})
+    })
+    // 用服务器返回的正式数据替换乐观项
+    const idx = benbenList.value.findIndex(x => x.id === optimisticId)
+    if (idx !== -1 && res?.id) benbenList.value.splice(idx, 1, res)
+    // 成功后才清空输入框和回复上下文；限流失败时保留以便重发
+    benbenContent.value = ''
+    currentReplyingId.value = null
+    currentReplyUsername.value = null
+  } catch (error: any) {
+    console.error('发布失败:', error)
+    // 回滚乐观项
+    const idx = benbenList.value.findIndex(x => x.id === optimisticId)
+    if (idx !== -1) benbenList.value.splice(idx, 1)
+    const errorMessage = error.response?.data?.detail || error.message || '未知错误'
+    alert('发布失败：' + errorMessage)
+  } finally {
+    posting.value = false
+  }
+}
+
+// 删除犇犇
+const deleteBenben = async (id: number) => {
+  try {
+    await apiClient.delete(`/benben/${id}`)
+    await loadBenbenList(true)
+  } catch (error: any) {
+    console.error(error)
+    alert('删除失败：' + (error.response?.data?.detail || error.message || '未知错误'))
+  }
+}
+
+// 回复犇犇
+const replyToBenben = (item: any) => {
+  currentReplyingId.value = item.id
+  currentReplyUsername.value = item.username
+  const replyText = ` || @${item.username} : ${item.content}`
+  benbenContent.value = replyText
+
+  nextTick(() => {
+    benbenTextareaRef.value?.setCaretToStart()
+  })
+}
+
+// 举报犇犇：跳转独立举报页（返回时页面重建会自动刷新列表）
+const openReport = (item: any) => {
+  router.push(`/report/benben/${item.id}`)
+}
+
+// 加载犇犇列表
+const loadBenbenList = async (reset = true) => {
+  if (isLoading.value) return
+
+  // 未登录用户不加载动态列表
+  if (!isLoggedIn.value) {
+    isLoading.value = false
+    hasMore.value = false
+    updateSentinel()
+    return
+  }
+
+  if (reset) {
+    hasMore.value = true
+    lastId.value = null
+    benbenList.value = []
+    sentinelText.value = '加载中...'
+    sentinelVisible.value = true
+  }
+
+  if (!hasMore.value) {
+    updateSentinel()
+    return
+  }
+
+  isLoading.value = true
+  sentinelText.value = '加载中...'
+  sentinelVisible.value = true
+
+  try {
+    let url = `/benben?limit=20`
+    if (lastId.value) url += `&before_id=${lastId.value}`
+    if (feedMode.value === 'my') url += '&mode=my'
+
+    // 响应拦截器已解包 response.data
+    const data = (await apiClient.get(url)) as any[]
+
+    if (data && data.length > 0) {
+      benbenList.value = reset ? data : [...benbenList.value, ...data]
+      lastId.value = data[data.length - 1].id
+
+      if (data.length < 20) {
+        hasMore.value = false
+        sentinelText.value = '没有更多动态了'
+      } else {
+        hasMore.value = true
+        sentinelText.value = '点击加载更多'
+      }
+    } else {
+      hasMore.value = false
+      if (reset) benbenList.value = []
+      sentinelText.value = '没有更多动态了'
+    }
+  } catch (error) {
+    console.error(error)
+    sentinelText.value = '加载出错，请刷新'
+  } finally {
+    isLoading.value = false
+    updateSentinel()
+  }
+}
+
+// ==================== 犇犇自动刷新 ====================
+// 不做「定时全量重拉」，而是拿列表里最新一条的 id 做 after_id 增量拉，
+// 没新动态时后端只返回空数组（一个索引区间查询），所以可以刷得勤一点。
+// 成本：5 秒一轮 ≈ 单用户每分钟 12 次请求，页面隐藏时直接跳过不刷。
+const REFRESH_INTERVAL = 5000
+
+const pendingBenben = ref<any[]>([])
+const flashIds = ref<Set<number>>(new Set())
+const benbenListRef = ref<HTMLElement | null>(null)
+let refreshTimer: number | undefined
+let flashTimer: number | undefined
+let adTimer: number | undefined
+
+// 最新一条「真实」犇犇的 id（乐观插入的临时项 id 是负数，必须排除）
+const newestRealId = computed(() => {
+  let max = 0
+  for (const item of benbenList.value) {
+    if (typeof item.id === 'number' && item.id > max) max = item.id
+  }
+  return max
+})
+
+// 是否直接插入列表最前面。
+// 只有「用户已经滚进列表内部、正在看旧帖子」时才改用浮动提示 —— 那种情况下
+// 插入新内容会把正在读的帖子顶下去。列表还在视野下方（没滚到）或者页面顶部时
+// 插入根本看不出变化，直接插就行。
+const shouldInsertInline = () => {
+  const el = benbenListRef.value
+  if (!el) return true
+  return el.getBoundingClientRect().top > -24
+}
+
+// 插到列表最前面，并短暂高亮
+const prependBenben = (items: any[]) => {
+  const known = new Set(benbenList.value.map((x) => x.id))
+  const fresh = items.filter((x) => !known.has(x.id))
+  pendingBenben.value = []
+  if (fresh.length === 0) return
+
+  benbenList.value = [...fresh, ...benbenList.value]
+  flashIds.value = new Set(fresh.map((x) => x.id))
+  clearTimeout(flashTimer)
+  flashTimer = setTimeout(() => {
+    flashIds.value = new Set()
+  }, 2600)
+}
+
+/**
+ * 核对列表里的犇犇是否还在，把被删掉的摘掉。
+ *
+ * 增量刷新只按 after_id 拉「新的」，所以别人删掉一条之后前端根本收不到任何信号，
+ * 那条就一直挂在页面上，非得手动刷新才消失。
+ * 这里每个周期再问一次后端「这些 id 还有几条活着」，只回 id，代价很小。
+ * 乐观插入的临时项 id 是负数，永远保留（它还等着服务端返回真 id）。
+ */
+const dropDeletedBenben = async () => {
+  const ids = [...benbenList.value, ...pendingBenben.value]
+    .map((x) => x.id)
+    .filter((id) => typeof id === 'number' && id > 0)
+  if (ids.length === 0) return
+
+  const data = (await apiClient.get(`/benben/existing?ids=${ids.join(',')}`)) as any
+  const alive = new Set<number>(Array.isArray(data?.ids) ? data.ids : [])
+  const keep = (x: any) => typeof x.id !== 'number' || x.id < 0 || alive.has(x.id)
+
+  benbenList.value = benbenList.value.filter(keep)
+  pendingBenben.value = pendingBenben.value.filter(keep)
+}
+
+const refreshBenben = async () => {
+  if (document.hidden || isLoading.value || posting.value || !isLoggedIn.value) return
+  const topId = newestRealId.value
+
+  try {
+    // 列表空的时候没有 after_id 可用（用了就永远拉不到东西），退化成拉最新一页。
+    // 删空 / 本来就一条都没有时全靠这条兜底，否则自动刷新会就此停摆。
+    let url = topId ? `/benben?limit=50&after_id=${topId}` : '/benben?limit=50'
+    if (feedMode.value === 'my') url += '&mode=my'
+
+    const data = (await apiClient.get(url)) as any[]
+    const fresh = data ?? []
+
+    // 先摘掉被删的，再插入新的，免得刚插进来的又被误判
+    await dropDeletedBenben()
+
+    if (fresh.length === 0) {
+      pendingBenben.value = []
+      return
+    }
+
+    if (shouldInsertInline()) {
+      prependBenben(fresh)
+    } else {
+      // 用户正在下边看别的，先攒着。after_id 固定不变，所以每次拉到的
+      // 都是「比当前已显示的最新一条还新」的全集，直接覆盖即可。
+      pendingBenben.value = fresh
+    }
+  } catch (error) {
+    // 自动刷新失败不打扰用户，静默跳过，下个周期再试
+    console.error('犇犇自动刷新失败:', error)
+  }
+}
+
+// 点「N 条新动态」：插入并滚到列表顶部
+const showPendingBenben = () => {
+  prependBenben(pendingBenben.value)
+  const el = benbenListRef.value
+  if (!el) return
+  // 减掉吸顶导航栏的高度，别把第一条又藏在它后面
+  const y = el.getBoundingClientRect().top + window.pageYOffset - 76
+  window.scrollTo({ top: Math.max(0, y), behavior: 'smooth' })
+}
+
+// 切回标签页时立刻刷一次 —— 这往往正是用户想要的时机
+const handleVisibility = () => {
+  if (!document.hidden) void refreshBenben()
+}
+
+// 回到顶部
+const showBackTop = ref(false)
+
+const handleScroll = () => {
+  showBackTop.value = window.pageYOffset > 300
+}
+const backToTop = () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' })
+}
+
+// ==================== 推荐训练题单 ====================
+const featuredTrainingLists = ref<TrainingListItem[]>([])
+const featuredTrainingLoading = ref(false)
+
+const loadFeaturedTraining = async () => {
+  featuredTrainingLoading.value = true
+  try {
+    const res = await trainingsApi.list({ featured_only: true, page: 1, page_size: 6 })
+    featuredTrainingLists.value = res.items
+  } catch (e) {
+    console.error('Failed to load featured training lists:', e)
+  } finally {
+    featuredTrainingLoading.value = false
+  }
+}
+
+// 生命周期
+onMounted(async () => {
+  window.addEventListener('scroll', handleScroll, { passive: true })
+  let lastDayStr = getTodayDateStr()
+  clockTimer = window.setInterval(() => {
+    now.value = new Date()
+    // 跨天：重新拉取打卡状态（零点后未打卡状态要立即恢复可打卡）
+    const today = getTodayDateStr()
+    if (today !== lastDayStr) {
+      lastDayStr = today
+      loadCheckin()
+    }
+  }, 60000)
+  loadRecentPosts()
+  void loadFriendLinks()
+  loadCheckin()
+  void loadFeaturedTraining()
+  await loadHomeAds()
+
+  if (isLoggedIn.value) {
+    await loadBenbenList(true)
+
+    // 犇犇自动刷新（切回标签页也会立刻刷一次）
+    refreshTimer = window.setInterval(() => {
+      void refreshBenben()
+    }, REFRESH_INTERVAL)
+    document.addEventListener('visibilitychange', handleVisibility)
+  } else {
+    updateSentinel()
+  }
+
+  adTimer = window.setInterval(cycleAdForward, 3500)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('scroll', handleScroll)
+  if (clockTimer) clearInterval(clockTimer)
+  if (refreshTimer) clearInterval(refreshTimer)
+  if (adTimer) clearInterval(adTimer)
+  clearTimeout(flashTimer)
+  document.removeEventListener('visibilitychange', handleVisibility)
+})
+</script>
+
+<template>
+  <div class="home-page">
+    <div class="home-container">
+      <!-- ===== 打卡卡片 ===== -->
+      <div class="card punch-card">
+        <div class="lg-punch">
+          <div class="ad-col">
+            <div v-if="adItems.length" class="ad-carousel">
+              <div class="ad-frame">
+                <Transition name="ad-fade" mode="out-in">
+                  <a
+                    :key="adItems[currentAdIndex].image + adItems[currentAdIndex].link"
+                    class="ad-slide"
+                    :href="adItems[currentAdIndex].link"
+                    @click.prevent="goAd(adItems[currentAdIndex].link)"
+                  >
+                    <img :src="adItems[currentAdIndex].image" class="ad-image">
+                  </a>
+                </Transition>
+                <button class="ad-arrow ad-arrow-left" @click.stop="cycleAdBackward" aria-label="上一张"><i class="fa-solid fa-caret-left"></i></button>
+                <button class="ad-arrow ad-arrow-right" @click.stop="cycleAdForward" aria-label="下一张"><i class="fa-solid fa-caret-right"></i></button>
+              </div>
+              <div class="ad-ctrl">
+                <span v-for="(ad, idx) in adItems" :key="idx" class="ad-dot" :class="{ active: idx === currentAdIndex }" @click="currentAdIndex = idx"></span>
+              </div>
+            </div>
+            <div v-else class="ad-placeholder">
+              <span>没有更多广告了</span>
+            </div>
+          </div>
+
+          <!-- 打卡/运势面板 -->
+          <div class="fortune-col">
+            <template v-if="!checkedInToday">
+              <p v-if="isLoggedIn" class="welcome-line">
+                欢迎回来，<router-link
+                  :to="`/user/${currentUser?.user_number}`"
+                  class="benben-username"
+                  :style="{ color: meColor }"
+                >{{ currentUser?.username }}</router-link><span
+                  v-if="meTag"
+                  class="user-tag-display"
+                  :style="{ backgroundColor: meColor }"
+                >{{ meTag }}</span>
+              </p>
+
+              <div class="lg-index-calendar">
+                <div class="lg-punch-left">
+                  <span v-for="(ch, i) in monthChineseFull.split('')" :key="'m' + i">{{ ch }}</span>
+                </div>
+                <span class="lg-punch-big">{{ dayStr }}</span>
+                <div class="lg-punch-right">
+                  <span v-for="(ch, i) in weekday.split('')" :key="'w' + i">{{ ch }}</span>
+                </div>
+              </div>
+
+              <div class="lg-small">
+                距 <strong>CSP-J/S 2026 第一轮</strong> <strong>{{ cspLabel1 }}</strong><br>
+                距 <strong>CSP-J/S 2026 第二轮</strong> <strong>{{ cspLabel2 }}</strong><br>
+                <button v-if="isLoggedIn" class="am-btn am-btn-warning" @click.stop="doPunch">点击打卡</button>
+              </div>
+            </template>
+
+            <template v-else>
+              <h2 class="fortune-title">
+                <router-link
+                  :to="`/user/${currentUser?.user_number}`"
+                  class="benben-username"
+                  :style="{ color: meColor }"
+                >{{ currentUser?.username }}</router-link><span
+                  v-if="meTag"
+                  class="user-tag-display"
+                  :style="{ backgroundColor: meColor }"
+                >{{ meTag }}</span> <span class="fortune-title-suffix">的运势</span>
+              </h2>
+
+              <div class="fortune-result-wrap">
+                <span class="lg-punch-result" :class="fortuneClass" :style="{ color: fortuneColor }">§ {{ fortuneLabel }} §</span>
+              </div>
+
+              <!-- 大吉：万事皆宜 -->
+              <div v-if="fortuneLabel === '大吉'" class="fortune-grid">
+                <div class="fortune-col-item">
+                  <div v-for="item in fortuneGoodItems" :key="item.name" class="fortune-entry">
+                    <span class="lg-bold fortune-good-label">宜：{{ item.name }}</span><br>
+                    <span class="lg-small fortune-desc">{{ item.desc }}</span>
+                  </div>
+                </div>
+                <div class="fortune-col-item">
+                  <span class="lg-bold fortune-nothing">万事皆宜</span>
+                </div>
+              </div>
+
+              <!-- 大凶：诸事不宜 -->
+              <div v-else-if="fortuneLabel === '大凶'" class="fortune-grid">
+                <div class="fortune-col-item">
+                  <span class="lg-bold fortune-nothing-red">诸事不宜</span>
+                </div>
+                <div class="fortune-col-item">
+                  <div v-for="item in fortuneBadItems" :key="item.name" class="fortune-entry">
+                    <span class="lg-bold fortune-bad-strong">忌：</span>
+                    <span class="fortune-bad-name">{{ item.name }}</span><br>
+                    <span class="lg-small fortune-desc">{{ item.desc }}</span>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 其他：宜忌并排 -->
+              <div v-else class="fortune-grid">
+                <div class="fortune-col-item">
+                  <div v-for="item in fortuneGoodItems" :key="item.name" class="fortune-entry">
+                    <span class="lg-bold fortune-good-label">宜：{{ item.name }}</span><br>
+                    <span class="lg-small fortune-desc">{{ item.desc }}</span>
+                  </div>
+                </div>
+                <div class="fortune-col-item">
+                  <div v-for="item in fortuneBadItems" :key="item.name" class="fortune-entry">
+                    <span class="lg-bold fortune-bad-name">忌：{{ item.name }}</span><br>
+                    <span class="lg-small fortune-desc">{{ item.desc }}</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="lg-small fortune-days">
+                你已经在 <span class="brand-highlight"> NLNOJ </span> 连续打卡了 <strong>{{ streakDays }}</strong> 天
+              </div>
+            </template>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== 友情链接 + 近期讨论 ===== -->
+      <div class="home-community-grid">
+        <section class="card friend-links-card">
+          <div class="card-header">友情链接</div>
+          <div v-if="friendLinksLoading" class="empty-state">加载中...</div>
+          <div v-else-if="friendLinks.length === 0" class="empty-state">暂无友情链接</div>
+          <div v-else class="friend-links-grid">
+            <a
+              v-for="link in friendLinks"
+              :key="link.id"
+              class="friend-link-item"
+              :href="link.url"
+              target="_blank"
+              rel="noopener noreferrer"
+              :title="link.title"
+            >
+              <img :src="link.icon" :alt="link.title" loading="lazy">
+              <span>{{ link.title }}</span>
+            </a>
+          </div>
+        </section>
+
+        <!-- ===== 近期讨论 ===== -->
+        <div class="card recent-posts-card">
+          <div class="card-header">近期讨论</div>
+          <div class="recent-posts-list">
+          <div v-if="recentLoading" class="empty-state">加载中...</div>
+          <div v-else-if="recentPosts.length === 0" class="empty-state">没有更多讨论了</div>
+          <section
+            v-for="p in recentPosts"
+            v-else
+            :key="p.id"
+            class="post-card"
+            @click="$router.push(`/discuss/${p.id}`)"
+          >
+            <div class="post-card-body">
+              <div class="post-avatar">
+                <UserAvatarStatus :user="p.author" :size="8">
+                  <img :src="getUserAvatar(p.author)" :alt="p.author?.username"
+                    @error="($event.target as HTMLImageElement).src = letterAvatar(p.author?.username)">
+                </UserAvatarStatus>
+              </div>
+              <div class="post-info">
+                <span class="post-title-link">{{ p.title }}</span>
+                <div class="post-meta-line">
+                  <div class="post-meta-row1">
+                    <span class="post-author-forum">
+                      <router-link
+                        :to="p.author?.user_number ? `/user/${p.author.user_number}` : '#'"
+                        class="benben-username"
+                        :style="{ color: getUserDisplayColor(p.author) }"
+                        @click.stop
+                      >{{ p.author?.username }}</router-link>
+                      <span
+                        v-if="getUserTagDisplay(p.author)"
+                        class="user-tag-display"
+                        :style="{ backgroundColor: getUserDisplayColor(p.author) }"
+                      >{{ getUserTagDisplay(p.author) }}</span>
+                      In <span class="post-forum-name">{{ p.forum_name }}</span>
+                    </span>
+                  </div>
+                  <div class="post-meta-row2">
+                    <span class="post-time-reply">{{ relTime(p.created_at) }} {{ p.reply_count }}回复</span>
+                    <span v-if="p.is_pinned" class="pin-badge">置顶</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== 训练题单（精选推荐） ===== -->
+      <div class="card home-training-section">
+        <div class="section-header-row">
+          <div class="card-header">训练题单</div>
+          <router-link to="/training" class="more-link">
+            全部题单 <i class="fa-solid fa-angle-right"></i>
+          </router-link>
+        </div>
+
+        <div v-if="featuredTrainingLoading" class="empty-state">加载中...</div>
+        <div v-else-if="featuredTrainingLists.length === 0" class="empty-state">
+          暂无推荐题单
+        </div>
+        <div v-else class="home-training-grid">
+          <div
+            v-for="item in featuredTrainingLists"
+            :key="item.id"
+            class="home-training-card"
+            @click="router.push(`/training/${item.id}`)"
+          >
+            <div class="ht-header">
+              <span class="ht-title">{{ item.title }}</span>
+              <span class="badge-featured-sm"><i class="fa-solid fa-star"></i> 精选</span>
+            </div>
+            <p v-if="item.description" class="ht-desc">{{ item.description }}</p>
+            <div class="ht-footer">
+              <div class="ht-meta">
+                <span><i class="fa-solid fa-clipboard-list"></i> {{ item.problem_count }} 题</span>
+                <span v-if="item.owner"><i class="fa-solid fa-user"></i> {{ item.owner.username }}</span>
+              </div>
+              <div v-if="item.problem_count > 0 && isLoggedIn" class="ht-progress">
+                <span class="ht-prog-text">{{ item.solved_count }}/{{ item.problem_count }}</span>
+                <div class="ht-prog-bar">
+                  <div
+                    class="ht-prog-fill"
+                    :style="{ width: `${Math.min(100, Math.round((item.solved_count / item.problem_count) * 100))}%` }"
+                  ></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== 犇犇模块（学术模式下隐藏） ===== -->
+      <div v-if="isLoggedIn && !academicMode" class="card benben-module">
+        <div class="benben-header">有什么新鲜事告诉大家</div>
+
+        <div class="benben-editor">
+          <BenbenMarkdownEditor
+            ref="benbenTextareaRef"
+            v-model="benbenContent"
+            :rows="3"
+            :maxlength="currentUser?.is_admin ? 10000 : MAX_LENGTH"
+            :disabled="cannotSpeak"
+            placeholder="有什么新鲜事告诉大家…（支持 Markdown，可换行、贴链接、写公式）"
+          />
+          <div class="benben-submit-btn">
+            <button
+              class="auth-btn"
+              :disabled="cannotSpeak || posting"
+              @click="postBenben"
+            >
+              {{ posting ? '发射中...' : '发射犇犇！' }}
+            </button>
+          </div>
+        </div>
+
+        <div class="benben-nav">
+          <div class="benben-tab" :class="{ active: feedMode === 'all' }" @click="switchTab('all')">全部</div>
+          <div class="benben-tab" :class="{ active: feedMode === 'my' }" @click="switchTab('my')">我的</div>
+        </div>
+
+        <div class="benben-list" ref="benbenListRef">
+          <div v-if="benbenList.length === 0 && !isLoading" class="benben-empty">
+            {{ sentinelText === '加载出错，请刷新' ? sentinelText : '没有更多动态了' }}
+          </div>
+
+          <div v-for="item in benbenList" :key="item.id" class="benben-item" :data-id="item.id">
+            <div class="benben-avatar">
+              <UserAvatarStatus :user="item" :size="8">
+                <router-link :to="`/user/${item.user_number}`">
+                  <img
+                    :src="getUserAvatar(item)"
+                    :alt="item.username"
+                    @error="($event.target as HTMLImageElement).src = letterAvatar(item.username)"
+                  >
+                </router-link>
+              </UserAvatarStatus>
+            </div>
+
+            <div class="benben-content" :class="{ 'is-new': flashIds.has(item.id) }">
+              <div class="benben-item-header">
+                <div class="post-author">
+                  <span class="benben-user">
+                    <router-link
+                      :to="`/user/${item.user_number}`"
+                      class="benben-username"
+                      :style="{ color: getUserDisplayColor(item) }"
+                    >{{ item.username }}</router-link><span
+                      v-if="getUserTagDisplay(item)"
+                      class="user-tag-display"
+                      :style="{ backgroundColor: getUserDisplayColor(item) }"
+                    >{{ getUserTagDisplay(item) }}</span>
+                  </span>
+                  <span class="benben-time">{{ formatTime(item.created_at) }}</span>
+                </div>
+
+                <div class="benben-actions">
+                  <button
+                    v-if="currentUser?.user_number !== item.user_number && currentUser?.can_speak"
+                    class="benben-report-btn"
+                    @click="openReport(item)"
+                  >举报</button>
+                  <button class="benben-reply-btn" @click="replyToBenben(item)">回复</button>
+                  <button
+                    v-if="currentUser?.user_number === item.user_number"
+                    class="benben-delete"
+                    @click="deleteBenben(item.id)"
+                  >删除</button>
+                </div>
+              </div>
+
+              <div class="benben-text prose" v-html="renderMarkdown(item.content)"></div>
+
+              <div v-if="item.reply_to_username" class="benben-reply-hint">
+                <i class="fa-solid fa-reply"></i> 回复了 @{{ item.reply_to_username }}
+              </div>
+            </div>
+          </div>
+
+          <div v-show="sentinelVisible" ref="loadingSentinelRef" class="loading-sentinel">
+            <button
+              v-if="hasMore && !isLoading && sentinelText !== '加载出错，请刷新'"
+              type="button"
+              class="load-more-btn"
+              @click="loadBenbenList(false)"
+            >
+              {{ sentinelText }}
+            </button>
+            <span v-else>{{ sentinelText }}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 回到顶部 -->
+    <button v-show="showBackTop" class="back-to-top" title="回到顶部" @click="backToTop"><i class='fa-solid fa-arrow-up'></i></button>
+
+    <!-- 有新动态但用户不在列表顶部时的提示（固定在底部居中，不挡内容） -->
+    <Transition name="benben-pill">
+      <button v-if="pendingBenben.length" class="benben-new-pill" @click="showPendingBenben">
+        <i class='fa-solid fa-arrow-up'></i> {{ pendingBenben.length }} 条新动态
+      </button>
+    </Transition>
+  </div>
+
+</template>
+
+<style scoped>
+/* ========== 页面容器 ========== */
+.home-page {
+  min-height: 100vh;
+  line-height: 1.5;
+}
+
+.home-container {
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+/* ========== 卡片 ========== */
+/* 背景/圆角/边框/阴影由全局 .card 基类统一提供（亚克力），这里只管布局 */
+.card {
+  padding: 20px 24px;
+  margin-bottom: 24px;
+}
+
+.card-header {
+  font-size: 1.25rem;
+  font-weight: 600;
+  border-left: 4px solid var(--primary);
+  padding-left: 12px;
+  margin-bottom: 20px;
+}
+
+.home-community-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.5fr);
+  align-items: stretch;
+  gap: 18px;
+  margin-bottom: 24px;
+}
+
+.home-community-grid > .card {
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+.friend-links-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(88px, 1fr));
+  gap: 8px;
+}
+
+.friend-link-item {
+  display: flex;
+  min-width: 0;
+  min-height: 96px;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 9px 6px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-primary);
+  text-align: center;
+  text-decoration: none;
+  transition: border-color 0.2s, background 0.2s, transform 0.2s;
+}
+
+.friend-link-item:hover {
+  border-color: var(--primary);
+  background: var(--surface-strong);
+  transform: translateY(-2px);
+}
+
+.friend-link-item img {
+  width: 42px;
+  height: 42px;
+  object-fit: contain;
+}
+
+.friend-link-item span {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+/* ========== 打卡卡片 ========== */
+.punch-card {
+  padding: 18px 24px 20px;
+}
+
+.punch-card .lg-punch {
+  text-align: center;
+  display: flex;
+  gap: 20px;
+  align-items: stretch;
+}
+
+.punch-card .ad-col {
+  flex: 2;
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+}
+
+.ad-carousel {
+  width: 100%;
+  position: relative;
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  height: 344px;
+}
+
+.ad-frame {
+  position: relative;
+  width: 100%;
+  flex: 0 0 320px;
+  height: 320px;
+  border-radius: 14px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
+  border: 1px solid #dde2f7;
+}
+
+.ad-slide {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.ad-fade-enter-active,
+.ad-fade-leave-active {
+  transition: opacity 0.42s ease, transform 0.42s ease;
+}
+
+.ad-fade-enter-from {
+  opacity: 0;
+  transform: translateX(18px);
+}
+
+.ad-fade-leave-to {
+  opacity: 0;
+  transform: translateX(-18px);
+}
+
+.ad-image {
+  width: 100%;
+  height: 100%;
+  min-height: 320px;
+  object-fit: cover;
+  display: block;
+}
+
+.ad-arrow {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(0, 0, 0, 0.45);
+  color: #fff;
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.ad-arrow:hover {
+  background: var(--primary);
+}
+
+.ad-arrow-left {
+  left: 12px;
+}
+
+.ad-arrow-right {
+  right: 12px;
+}
+
+.ad-ctrl {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.ad-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #ccd1dc;
+  cursor: pointer;
+}
+
+.ad-dot.active {
+  width: 24px;
+  border-radius: 99px;
+  background: var(--primary);
+}
+
+.punch-card .fortune-col {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.ad-placeholder {
+  width: 100%;
+  height: 320px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  color: var(--text-sub);
+  font-size: 14px;
+  border-radius: 12px;
+}
+
+.welcome-line {
+  font-weight: 700;
+  font-size: 1.2rem;
+  margin-bottom: 8px;
+}
+
+.lg-index-calendar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 8px 0 12px;
+  color: #396A42;
+}
+
+.lg-index-calendar .lg-punch-left,
+.lg-index-calendar .lg-punch-right {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0;
+  font-size: 0.95rem;
+  font-weight: 400;
+  color: #396A42;
+  line-height: 1.3;
+}
+
+.lg-index-calendar .lg-punch-big {
+  font-size: 5rem;
+  font-weight: 700;
+  color: #396A42;
+  line-height: 1.1;
+  letter-spacing: 2px;
+}
+
+.lg-small {
+  font-size: 0.95rem;
+  color: var(--text-sub);
+  line-height: 1.8;
+}
+
+.lg-small strong {
+  color: var(--text-strong);
+  font-weight: 700;
+}
+
+.am-btn {
+  display: inline-block;
+  padding: 8px 16px;
+  margin-top: 10px;
+  font-size: 15px;
+  font-weight: normal;
+  border: none;
+  border-radius: 40px;
+  cursor: pointer;
+  transition: background 0.2s, opacity 0.2s;
+  text-decoration: none;
+  color: #fff;
+}
+
+.am-btn-warning {
+  background: #F37B1D;
+}
+
+.am-btn-warning:hover {
+  background: #E0690C;
+}
+
+.fortune-title {
+  margin-bottom: 0;
+  font-size: 1.3rem;
+  font-weight: 500;
+  color: var(--text-strong);
+  text-align: center;
+}
+
+.fortune-title-suffix {
+  font-weight: bold;
+}
+
+.lg-bold {
+  font-weight: bold;
+}
+
+.fortune-result-wrap {
+  text-align: center;
+}
+
+.lg-punch-result {
+  font-size: 4rem;
+  font-weight: bold;
+  letter-spacing: 4px;
+  padding: 8px 32px;
+  border-radius: 30px;
+  display: inline-block;
+  margin-bottom: 12px;
+  line-height: 1.2;
+}
+
+.lg-fg-red {
+  color: #E74C3C;
+}
+
+.lg-fg-green {
+  color: #5EB95E;
+}
+
+.lg-fg-black {
+  color: var(--text-strong);
+}
+
+.fortune-grid {
+  display: flex;
+  /* 宜 / 忌 必须水平并排：这里不能换行。
+     运势栏只占 lg-punch 的约 1/3 宽（≈290px），
+     若允许 wrap，两块 200px 起步的栏目永远放不下，必然上下堆叠。 */
+  flex-wrap: nowrap;
+  gap: 16px 20px;
+  margin: 6px 0 10px;
+}
+
+.fortune-grid .fortune-col-item {
+  /* 等宽两栏；min-width:0 必需，否则内容会把 flex 子项撑破并溢出容器 */
+  flex: 1 1 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.fortune-entry {
+  margin-bottom: 10px;
+  line-height: 1.5;
+}
+
+.fortune-good-label {
+  color: #E74C3C;
+}
+
+.fortune-desc {
+  display: block;
+  margin-top: 1px;
+  padding-left: 2px;
+}
+
+.fortune-nothing {
+  color: var(--text-strong);
+  font-size: 1rem;
+  line-height: 1.5;
+}
+
+.fortune-nothing-red {
+  color: #E74C3C;
+  font-size: 1rem;
+  line-height: 1.5;
+}
+
+.fortune-bad-strong {
+  color: var(--text-strong);
+}
+
+.fortune-bad-name {
+  color: var(--text-strong);
+}
+
+.fortune-days {
+  text-align: center;
+  padding-top: 8px;
+  margin-top: 4px;
+}
+
+.brand-highlight {
+  color: var(--primary);
+  font-weight: 700;
+}
+
+/* ========== 近期讨论 ========== */
+.recent-posts-list {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.empty-state {
+  text-align: center;
+  padding: 40px 20px;
+  color: var(--text-sub);
+  font-size: 14px;
+  grid-column: 1 / -1;
+}
+
+.recent-posts-card .post-card {
+  background: var(--surface);
+  border: var(--border-width) solid var(--border-color);
+  border-radius: var(--radius-sm);
+  transition: border-color 0.2s, box-shadow 0.2s;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  cursor: pointer;
+}
+
+.recent-posts-card .post-card:hover {
+  border-color: var(--primary);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06);
+}
+
+.post-card-body {
+  display: flex;
+  gap: 14px;
+  padding: 14px 16px;
+  align-items: center;
+}
+
+.post-avatar img {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  object-fit: cover;
+  display: block;
+  background: var(--bg-subtle);
+}
+
+.post-avatar {
+  flex-shrink: 0;
+}
+
+.post-title-link {
+  color: var(--primary);
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.post-card:hover .post-title-link {
+  text-decoration: underline;
+}
+
+.post-meta-line {
+  margin-top: 4px;
+  font-size: 13px;
+  color: var(--text-sub);
+  display: flex;
+  flex-direction: column;
+  gap: 2px 0;
+}
+
+.post-forum-name {
+  color: var(--primary);
+}
+
+.post-time-reply strong {
+  color: var(--text-strong);
+}
+
+.pin-badge {
+  display: inline-block;
+  background: var(--primary);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 8px;
+  border-radius: 4px;
+  margin-left: 8px;
+  vertical-align: middle;
+}
+
+/* ========== 犇犇模块 ========== */
+.benben-header {
+  font-size: 1.15rem;
+  font-weight: 700;
+  border-left: 4px solid var(--primary);
+  padding-left: 12px;
+  margin-bottom: 16px;
+}
+
+.benben-editor {
+  margin-bottom: 20px;
+}
+
+.benben-editor textarea {
+  width: 100%;
+  padding: 12px 14px;
+  border: var(--border-width) solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: var(--surface-strong);
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text-main);
+  resize: vertical;
+  font-family: inherit;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.benben-editor textarea:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 15%, transparent);
+}
+
+.benben-submit-btn {
+  margin-top: 10px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.auth-btn {
+  background: var(--primary);
+  color: white;
+  border: none;
+  border-radius: 999px;
+  padding: 7px 22px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-block;
+  transition: background 0.15s ease, opacity 0.15s ease;
+}
+
+.auth-btn:hover:not(:disabled) {
+  background: var(--primary-hover);
+}
+
+.auth-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* 「全部 / 我的」：原来是一整条灰底 + 两个等宽分段，改成两颗轻量胶囊 */
+.benben-nav {
+  display: flex;
+  gap: 8px;
+  margin: 18px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.benben-tab {
+  flex: 0 0 auto;
+  cursor: pointer;
+  padding: 6px 18px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-sub);
+  background: transparent;
+  border: var(--border-width) solid transparent;
+  border-radius: 999px;
+  transition: color 0.18s ease, background-color 0.18s ease, border-color 0.18s ease;
+}
+
+.benben-tab:hover {
+  color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 6%, transparent);
+}
+
+.benben-tab.active {
+  color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 10%, transparent);
+  border-color: color-mix(in srgb, var(--primary) 35%, transparent);
+}
+
+.benben-list {
+  margin-top: 20px;
+}
+
+.benben-item {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 16px;
+  position: relative;
+}
+
+.benben-avatar {
+  flex-shrink: 0;
+  width: 40px;
+  margin-top: 2px;
+}
+
+.benben-avatar a {
+  display: block;
+}
+
+.benben-avatar img {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: var(--bg-subtle);
+}
+
+.benben-content {
+  flex: 1;
+  background: var(--surface);
+  -webkit-backdrop-filter: blur(var(--surface-blur)) saturate(1.5);
+  backdrop-filter: blur(var(--surface-blur)) saturate(1.5);
+  border: var(--border-width) solid var(--border-color);
+  border-radius: var(--radius-lg);
+  padding: 10px 16px 12px;
+  position: relative;
+  box-shadow: 0 1px 3px rgba(31, 41, 85, 0.05);
+}
+
+/* 原来这里有一对 ::before/::after 小三角（聊天气泡的“箭头”），
+   颜色是写死的 #f0f2f5/#e9ecef，跟半透明气泡对不上，看着很脏，已去掉。 */
+
+/* 作者行：原来是一条负 margin 出血的 #f0f2f5 灰头条，改成透明的一行，
+   用户名/时间/操作直接坐在亚克力气泡上。 */
+.benben-item-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  background: none;
+  padding: 0;
+  margin: 0 0 6px;
+}
+
+.post-author {
+  display: flex;
+  align-items: center;
+  gap: 4px 8px;
+  flex-wrap: wrap;
+}
+
+.benben-user {
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
+}
+
+.benben-username {
+  font-weight: 600;
+  color: var(--text-main);
+  text-decoration: none;
+  font-size: 14px;
+  vertical-align: middle;
+}
+
+.benben-username:hover {
+  color: var(--primary);
+}
+
+.user-tag-display {
+  display: inline-block;
+  border-radius: 6px;
+  padding: 1px 8px;
+  color: #fff;
+  font-size: 11.5px;
+  font-weight: 600;
+  margin: 0 0 0 6px;
+  cursor: default;
+  transition: filter 0.15s;
+  vertical-align: middle;
+}
+
+.user-tag-display:hover {
+  filter: brightness(0.9);
+}
+
+.benben-time {
+  font-size: 12px;
+  color: var(--text-sub);
+}
+
+.benben-time::before {
+  content: '·';
+  margin-right: 6px;
+}
+
+.benben-actions {
+  display: flex;
+  gap: 2px;
+  align-items: center;
+}
+
+/* 操作按钮做成小胶囊：平时只有文字，悬停才浮出底色 */
+.benben-report-btn,
+.benben-reply-btn,
+.benben-delete {
+  background: transparent;
+  border: none;
+  color: var(--text-sub);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 3px 10px;
+  border-radius: 999px;
+  transition: color 0.15s ease, background-color 0.15s ease;
+}
+
+.benben-report-btn:hover,
+.benben-reply-btn:hover {
+color: var(--primary-text);
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
+}
+
+.benben-delete:hover {
+  color: var(--danger);
+  background: rgba(239, 68, 68, 0.1);
+}
+
+.benben-text {
+  word-break: break-word;
+}
+
+/* 代码块/行内代码交给 assets/markdown.css 的 .prose 统一方案（深色 oneDark），
+   旧的浅色 pre/code 覆盖会让深底上的浅字看不清 */
+.benben-text :deep(a) {
+  color: var(--primary);
+  text-decoration: none;
+}
+
+.benben-text :deep(a:hover) {
+  text-decoration: underline;
+}
+
+.benben-reply-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-sub);
+}
+
+.benben-empty,
+.no-more-message {
+  text-align: center;
+  padding: 40px;
+  color: var(--text-sub);
+  font-size: 14px;
+}
+
+.loading-sentinel {
+  text-align: center;
+  padding: 20px;
+  color: var(--text-sub);
+  font-size: 13px;
+}
+
+/* ========== 犇犇新动态提示 ========== */
+.benben-new-pill {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 998;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 20px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--primary);
+  border: none;
+  border-radius: 999px;
+  cursor: pointer;
+  box-shadow: 0 4px 16px color-mix(in srgb, var(--glow-blue) 40%, transparent);
+  transition: background 0.15s, transform 0.15s;
+}
+
+.benben-new-pill:hover {
+  background: var(--primary-hover);
+  transform: translateX(-50%) translateY(-2px);
+}
+
+.benben-pill-enter-active,
+.benben-pill-leave-active {
+  transition: opacity 0.2s, transform 0.2s;
+}
+
+.benben-pill-enter-from,
+.benben-pill-leave-to {
+  opacity: 0;
+  transform: translateX(-50%) translateY(12px);
+}
+
+/* 自动刷新刚插进来的动态，短暂高亮一下就恢复。
+   卡片本身是半透明亚克力，高亮也用半透明主色，避免闪成不透明白块。 */
+.benben-content.is-new {
+  animation: benben-flash 2.6s ease-out;
+}
+
+@keyframes benben-flash {
+  0%,
+  55% {
+    background: color-mix(in srgb, var(--primary) 10%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 40%, transparent);
+  }
+  100% {
+    background: var(--surface);
+    border-color: var(--border-color);
+  }
+}
+
+/* ========== 回到顶部 ========== */
+.back-to-top {
+  position: fixed;
+  bottom: 30px;
+  right: 30px;
+  background: var(--primary);
+  color: #fff;
+  border: none;
+  border-radius: 50%;
+  width: 50px;
+  height: 50px;
+  font-size: 24px;
+  cursor: pointer;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+  z-index: 999;
+  transition: opacity 0.3s, transform 0.3s;
+}
+
+.back-to-top:hover {
+  background: var(--primary);
+  transform: scale(1.1);
+}
+
+/* 移动端：右下角被 SideBar 的菜单悬浮按钮占据（≤768px 在 right/bottom 20px 放 52px 圆钮，
+   ≤600px 是 16px/48px），回到顶部改为叠放在它正上方，留 12px 间距不再重叠。
+   底部安全区跟随菜单按钮，保证刘海屏上间距一致 */
+@media (max-width: 768px) {
+  .back-to-top {
+    right: 20px;
+    bottom: calc(84px + env(safe-area-inset-bottom, 0px)); /* 20 + 52 + 12 */
+  }
+}
+
+@media (max-width: 600px) {
+  .back-to-top {
+    right: 16px;
+    bottom: calc(76px + env(safe-area-inset-bottom, 0px)); /* 16 + 48 + 12 */
+    width: 44px;
+    height: 44px;
+    font-size: 22px;
+  }
+}
+
+/* ========== 响应式 ========== */
+@media (max-width: 700px) {
+  .home-community-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .punch-card .lg-punch {
+    flex-direction: column;
+  }
+
+  .punch-card .ad-col {
+    padding-bottom: 12px;
+    margin-bottom: 12px;
+  }
+
+  .ad-carousel,
+  .ad-placeholder {
+    height: 220px;
+    min-height: 220px;
+  }
+
+  .ad-frame,
+  .ad-image {
+    height: 200px;
+    min-height: 200px;
+  }
+
+  .ad-frame {
+    flex-basis: 200px;
+  }
+
+  .punch-card .ad-col,
+  .punch-card .fortune-col {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .punch-card .lg-punch-result {
+    font-size: 2.8rem;
+  }
+}
+
+@media (max-width: 600px) {
+  .recent-posts-list {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  .card {
+    padding: 14px;
+  }
+
+  /* 空状态盒子原本左右各 40px，手机上只剩 243px */
+  .benben-empty {
+    padding: 28px 16px;
+  }
+
+  .benben-item {
+    gap: 10px;
+  }
+
+  .benben-avatar {
+    width: 32px;
+    margin-top: 2px;
+  }
+
+  .benben-avatar img {
+    width: 32px;
+    height: 32px;
+  }
+
+  .benben-content {
+    padding: 8px 12px 10px;
+  }
+
+  .benben-item-header {
+    padding: 0;
+    margin: 0 0 6px;
+    gap: 4px;
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .post-author {
+    gap: 6px;
+  }
+
+  .benben-actions {
+    gap: 8px;
+  }
+
+  .benben-text {
+    font-size: 14px;
+  }
+
+  .lg-index-calendar .lg-punch-big {
+    font-size: 2rem;
+  }
+
+  .lg-small {
+    font-size: 0.88rem;
+  }
+
+  .am-btn {
+    padding: 6px 20px;
+    font-size: 14px;
+  }
+
+  .back-to-top {
+    bottom: 20px;
+    right: 20px;
+    width: 40px;
+    height: 40px;
+    font-size: 20px;
+  }
+}
+
+/* ========== 首页训练题单 ========== */
+.home-training-section {
+  padding: 20px 24px;
+}
+
+.section-header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+.section-header-row .card-header {
+  margin-bottom: 0;
+}
+
+.more-link {
+  font-size: 13px;
+  color: var(--primary);
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  transition: color 0.15s;
+}
+
+.more-link:hover {
+  text-decoration: underline;
+}
+
+.home-training-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 16px;
+}
+
+.home-training-card {
+  background: var(--surface);
+  backdrop-filter: blur(var(--surface-blur)) saturate(1.5);
+  border: var(--border-width) solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 16px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: flex;
+  flex-direction: column;
+}
+
+.home-training-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--primary);
+  box-shadow: var(--shadow-card-hover);
+}
+
+.ht-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.ht-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-main);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.badge-featured-sm {
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+color: var(--warning-text);
+  border: 1px solid #ffd591;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+}
+
+.ht-desc {
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.5;
+  margin: 0 0 12px 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  min-height: 38px;
+}
+
+.ht-footer {
+  margin-top: auto;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  color: var(--text-muted);
+  padding-top: 10px;
+  border-top: 1px dashed var(--border-color);
+}
+
+.ht-meta {
+  display: flex;
+  gap: 10px;
+}
+
+.ht-progress {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ht-prog-text {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--primary);
+}
+
+.ht-prog-bar {
+  width: 60px;
+  height: 6px;
+  background: #e2e8f0;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.ht-prog-fill {
+  height: 100%;
+  background: var(--primary);
+  border-radius: 3px;
+  transition: width 0.3s;
+}
+</style>

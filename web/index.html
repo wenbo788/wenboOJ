@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Lato:wght@400;700;900&family=Noto+Sans+SC:wght@400;500;700;900&family=JetBrains+Mono:wght@400;700&family=Roboto+Mono:wght@400;700&family=Source+Code+Pro:wght@400;700&family=IBM+Plex+Mono:wght@400;700&family=Space+Mono:wght@400;700&family=Courier+Prime:wght@400;700&display=swap" rel="stylesheet">
+
+    <title>NLNOJ</title>
+
+    <meta name="description" content="NLNOJ - 新一代社交型 Online Judge 平台">
+    <meta name="keywords" content="NLNOJ, OJ, 在线评测, 信奥, CSP, NOIP, 算法竞赛">
+    <meta name="author" content="NLNOJ Team">
+
+    <!-- Open Graph -->
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="NLNOJ">
+    <meta property="og:description" content="新一代社交型 Online Judge 平台">
+    <meta property="og:image" content="/welcome.png">
+    <meta property="og:url" content="/">
+
+    <!-- Twitter Card -->
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="NLNOJ">
+    <meta name="twitter:description" content="新一代社交型 Online Judge 平台">
+    <meta name="twitter:image" content="/welcome.png">
+
+    <meta name="msvalidate.01" content="C90495126D445F04B33D5C81EFEFD9AF" />
+
+    <script>
+      (function() {
+        var officialHost = atob('bmxub2ouZ3IzeXBoNG50b20uY24='); 
+        var currentHost = window.location.hostname;
+
+        // 本地开发不跳转
+        if (currentHost === 'localhost' || currentHost === '127.0.0.1' || currentHost === '::1') return;
+
+        // GitHub Pages 预览站（https://<user>.github.io/<repo>/）不跳转，
+        // 否则前端刚部署好就会被强制弹回官方站。自定义域请把域名加到这里。
+        if (/(^|\.)github\.io$/i.test(currentHost)) return;
+
+        if (currentHost !== officialHost) {
+          window.location.replace('https://' + officialHost + window.location.pathname + window.location.search);
+        }
+      })();
+    </script>
+
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

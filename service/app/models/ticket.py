@@ -1,0 +1,117 @@
+"""工单系统模型（参照洛谷工单设计适配）。
+
+类别：consult 一般咨询 / suggestion 建议反馈 / problem_submit 题目投递 / problem_content 题目内容 / bug Bug反馈 / appeal 账号申诉
+状态：pending 待处理 / replied 待补充 / processing 处理中 /
+      suspended 挂起 / resolved 已完成 / closed 已关闭 / deleted 已删除
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.models.base import Base, TimestampMixin
+
+
+class Ticket(Base, TimestampMixin):
+    __tablename__ = "tickets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # 展示编号（如 #1001），随自增 id 生成
+    title: Mapped[str] = mapped_column(String(100), nullable=False)
+    category: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="pending", index=True
+    )
+    creator_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id"), index=True, nullable=False
+    )
+    # 创建时的身份快照（用户改名后历史工单仍显示当时身份）
+    creator_username: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    creator_tag: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # 责任人（处理该工单的管理员，可空）
+    assignee_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id"), nullable=True
+    )
+    # 综合类工单默认公开（登录用户可见），申诉类私密
+    is_public: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    last_reply_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    # 最后回复方：user 用户 / staff 管理
+    last_reply_by: Mapped[str | None] = mapped_column(String(10), nullable=True)
+
+    creator: Mapped["User"] = relationship(  # noqa: F821
+        "User", foreign_keys=[creator_id], lazy="joined"
+    )
+    assignee: Mapped["User | None"] = relationship(  # noqa: F821
+        "User", foreign_keys=[assignee_id], lazy="joined"
+    )
+    replies: Mapped[list["TicketReply"]] = relationship(
+        back_populates="ticket", cascade="all, delete-orphan",
+        order_by="TicketReply.id",
+    )
+
+
+class TicketReply(Base, TimestampMixin):
+    __tablename__ = "ticket_replies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticket_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("tickets.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id"), index=True, nullable=False
+    )
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    # 回复时的身份快照
+    user_username: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    user_tag: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # 是否为管理员（处理者）回复
+    is_staff: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # 系统动作记录（非空 = 动作横幅：状态变更 / 标题修改 / 内容修改等）
+    # Text：标题修改记录含新旧标题全文，可能超过 100 字
+    action_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 动作关联的目标用户（如被指派的责任人）
+    action_target_user_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id"), nullable=True
+    )
+
+    user: Mapped["User"] = relationship(  # noqa: F821
+        "User", foreign_keys=[user_id], lazy="joined"
+    )
+    action_target: Mapped["User | None"] = relationship(  # noqa: F821
+        "User", foreign_keys=[action_target_user_id], lazy="joined"
+    )
+    ticket: Mapped["Ticket"] = relationship(back_populates="replies")
+    attachments: Mapped[list["TicketAttachment"]] = relationship(
+        back_populates="reply", cascade="all, delete-orphan",
+        order_by="TicketAttachment.id",
+    )
+
+
+class TicketAttachment(Base, TimestampMixin):
+    """工单附件：挂在回复上（创建工单时的描述附件挂首条回复）。"""
+
+    __tablename__ = "ticket_attachments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticket_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("tickets.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    reply_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("ticket_replies.id", ondelete="CASCADE"),
+        index=True, nullable=False,
+    )
+    uploader_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id"), index=True, nullable=False
+    )
+    # 展示用原始文件名 / 磁盘存储路径
+    orig_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    stored_path: Mapped[str] = mapped_column(String(500), nullable=False, unique=True)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    reply: Mapped["TicketReply"] = relationship(back_populates="attachments")

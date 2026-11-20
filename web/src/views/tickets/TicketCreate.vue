@@ -1,0 +1,538 @@
+<script setup lang="ts">
+import { ref, computed } from 'vue'
+import { useRouter } from 'vue-router'
+import { useAuthStore } from '@/stores/auth'
+import apiClient from '@/api/client'
+import MarkdownSplitEditor from '@/components/MarkdownSplitEditor.vue'
+
+const router = useRouter()
+const authStore = useAuthStore()
+
+interface CategoryOption {
+  key: string
+  name: string
+  desc: string
+  icon: string
+}
+
+const CATEGORIES: CategoryOption[] = [
+  { key: 'consult', name: '一般咨询', desc: '关于本站平台功能或相关事宜的询问', icon: 'fa-solid fa-comment' },
+  { key: 'suggestion', name: '建议反馈', desc: '为平台提供功能建议', icon: 'fa-solid fa-lightbulb' },
+  { key: 'problem_content', name: '题目内容', desc: '题面修正、数据问题及题解反馈', icon: 'fa-solid fa-book-open' },
+  { key: 'bug', name: 'Bug反馈', desc: '报告站点功能异常', icon: 'fa-solid fa-bug' },
+  { key: 'appeal', name: '账号申诉', desc: '被封禁用户提交的账号申诉', icon: 'fa-solid fa-shield-halved' },
+]
+
+const isBanned = computed(() => authStore.currentUser?.is_banned === true)
+
+const category = ref('')
+const title = ref('')
+const content = ref('')
+const submitting = ref(false)
+const error = ref('')
+
+// 附件（创建成功后自动上传，挂到工单描述）；支持多选，总和不超过 10MB
+const attachFiles = ref<File[]>([])
+const fileInput = ref<HTMLInputElement | null>(null)
+const onFileChange = (e: Event) => {
+  const input = e.target as HTMLInputElement
+  const picked = Array.from(input.files || [])
+  input.value = ''
+  if (!picked.length) return
+  for (const f of picked) {
+    if (f.size > 10 * 1024 * 1024) {
+      error.value = `「${f.name}」超过 10MB，未添加`
+      return
+    }
+  }
+  const total = attachFiles.value.reduce((s, f) => s + f.size, 0)
+    + picked.reduce((s, f) => s + f.size, 0)
+  if (total > 10 * 1024 * 1024) {
+    error.value = '所有附件总和不能超过 10MB'
+    return
+  }
+  attachFiles.value.push(...picked)
+  error.value = ''
+}
+
+const removeAttachFile = (idx: number) => {
+  attachFiles.value.splice(idx, 1)
+}
+
+// 相似工单查询（标题防抖）
+const similar = ref<any[]>([])
+const showSimilar = ref(false)
+let searchTimer: number | undefined
+
+const onTitleInput = () => {
+  window.clearTimeout(searchTimer)
+  if (title.value.trim().length < 2) {
+    similar.value = []
+    showSimilar.value = false
+    return
+  }
+  searchTimer = window.setTimeout(async () => {
+    try {
+      const data: any = await apiClient.get(`/api/tickets/similar?title=${encodeURIComponent(title.value.trim())}`)
+      // 响应必须是数组（防止被劫持/改写的请求返回 HTML 等非预期内容）
+      similar.value = Array.isArray(data) ? data : []
+      showSimilar.value = similar.value.length > 0
+    } catch {
+      similar.value = []
+      showSimilar.value = false
+    }
+  }, 400)
+}
+
+const pickCategory = (key: string) => {
+  // 封禁用户仅可提交账号申诉；未封禁用户不可提交申诉
+  if (isBanned.value && key !== 'appeal') return
+  if (!isBanned.value && key === 'appeal') return
+  category.value = key
+}
+
+const submit = async () => {
+  error.value = ''
+  if (!category.value) {
+    error.value = '请选择工单类别'
+    return
+  }
+  if (title.value.trim().length < 3) {
+    error.value = '标题至少 3 个字符，且应能体现主要需求'
+    return
+  }
+  if (content.value.trim().length < 5) {
+    error.value = '请填写工单内容（至少 5 个字符）'
+    return
+  }
+
+  submitting.value = true
+  try {
+    const payload: Record<string, any> = {
+      title: title.value.trim(),
+      category: category.value,
+      content: content.value.trim(),
+    }
+    const data: any = await apiClient.post('/api/tickets', payload)
+    // 附件：创建成功后自动上传，挂到工单描述（首条回复）
+    for (const f of attachFiles.value) {
+      try {
+        const form = new FormData()
+        form.append('file', f)
+        await apiClient.post(`/api/tickets/${data.id}/attachments`, form, {
+          headers: { 'Content-Type': 'multipart/form-data' }
+        })
+      } catch {
+        // 附件失败不阻断跳转，详情页可补传
+      }
+    }
+    router.push(`/tickets/${data.id}`)
+  } catch (err: any) {
+    error.value = err.response?.data?.detail || err.message || '提交失败'
+  } finally {
+    submitting.value = false
+  }
+}
+</script>
+
+<template>
+  <div class="ticket-create-page">
+    <div class="create-container">
+      <h2 class="page-title">提交工单</h2>
+
+      <!-- 规则提示 -->
+      <div class="rules-card">
+        <b><i class="fa-solid fa-clipboard-list"></i> 工单规范</b>
+        <ul>
+          <li><b>一事一单</b>：每个工单仅反馈一个具体问题，多个问题请分别创建</li>
+          <li><b>标题明确</b>：标题应体现主要需求，方便管理员快速识别分类</li>
+          <li><b>遵守社区规范</b>：提交内容与回复均须遵守本站社区规范</li>
+          <li><b>处理时效</b>：管理员通常会在 2 周内回复，特殊工单可能更久，请勿催促</li>
+        </ul>
+      </div>
+
+      <!-- 类别选择 -->
+      <div class="section-label">工单类别</div>
+      <div class="category-grid">
+        <div
+          v-for="c in CATEGORIES"
+          :key="c.key"
+          class="category-card"
+          :class="{
+            selected: category === c.key,
+            disabled: (isBanned && c.key !== 'appeal') || (!isBanned && c.key === 'appeal')
+          }"
+          @click="pickCategory(c.key)"
+        >
+          <div class="cat-icon"><i :class="c.icon"></i></div>
+          <div class="cat-name">{{ c.name }}</div>
+          <div class="cat-desc">{{ c.desc }}</div>
+        </div>
+      </div>
+      <p v-if="isBanned" class="ban-tip">⛔ 你当前处于封禁状态，仅可提交「账号申诉」工单。</p>
+
+
+
+      <!-- 标题 -->
+      <div class="section-label">标题 <span class="required">*</span></div>
+      <div class="title-wrap">
+        <input
+          v-model="title"
+          class="title-input"
+          placeholder="简要描述问题（3-100 字）"
+          maxlength="100"
+          @input="onTitleInput"
+          @focus="showSimilar = similar.length > 0"
+          @blur="showSimilar = false"
+        >
+        <!-- 相似工单提示 -->
+        <div v-if="showSimilar" class="similar-pop">
+          <div class="similar-head">找到 {{ similar.length }} 条相似工单，或许已有解决方案：</div>
+          <div
+            v-for="t in similar"
+            :key="t.id"
+            class="similar-item"
+            @mousedown.prevent="router.push(`/tickets/${t.id}`)"
+          >
+            <span class="similar-no">{{ t.ticket_no }}</span>
+            <span class="similar-title">{{ t.title }}</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 内容 -->
+      <div class="section-label">详细内容 <span class="required">*</span></div>
+      <MarkdownSplitEditor
+        v-model="content"
+        height="260px"
+        placeholder="请详细描述你的问题、建议或 Bug 的复现步骤……支持 Markdown 与 $公式$"
+        :maxlength="5000"
+      />
+
+      <!-- 附件 -->
+      <div class="section-label">附件 <span class="optional">（可选，可多选，总和 10MB 以内）</span></div>
+      <div class="attach-row">
+        <button class="btn-attach" type="button" @click="fileInput?.click()">
+          <i class="fa-solid fa-paperclip"></i> {{ attachFiles.length ? `已选 ${attachFiles.length} 个附件` : '添加附件' }}
+        </button>
+        <input ref="fileInput" type="file" multiple hidden @change="onFileChange">
+      </div>
+      <div v-if="attachFiles.length" class="attach-list">
+        <span v-for="(f, i) in attachFiles" :key="`${f.name}-${i}`" class="attach-chip">
+          <i class="fa-solid fa-paperclip"></i> {{ f.name }}（{{ (f.size / 1048576).toFixed(2) }}MB）
+          <button class="chip-x" type="button" title="移除" @click="removeAttachFile(i)">×</button>
+        </span>
+      </div>
+
+      <!-- 错误提示 -->
+      <div v-if="error" class="error-tip">❌ {{ error }}</div>
+
+      <div class="submit-bar">
+        <button class="btn-submit" :disabled="submitting" @click="submit">
+          {{ submitting ? '提交中...' : '提交工单' }}
+        </button>
+        <button class="btn-cancel" :disabled="submitting" @click="router.back()">取消</button>
+      </div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.ticket-create-page {
+  min-height: 100vh;
+  line-height: 1.6;
+}
+
+.create-container {
+  max-width: 760px;
+  margin: 0 auto;
+}
+
+.page-title {
+  font-size: 1.3rem;
+  font-weight: 700;
+  color: var(--text-strong);
+  margin-bottom: 16px;
+}
+
+.rules-card {
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+  border: 1px solid #ffe0b0;
+  border-radius: 12px;
+  padding: 14px 18px;
+  font-size: 13px;
+color: var(--warning-text);
+  margin-bottom: 20px;
+}
+
+.rules-card ul {
+  margin: 8px 0 0;
+  padding-left: 18px;
+}
+
+.rules-card li {
+  margin: 3px 0;
+}
+
+.section-label {
+  font-weight: 700;
+  font-size: 14px;
+  color: var(--text-strong);
+  margin: 18px 0 8px;
+}
+
+.required {
+  color: var(--primary);
+}
+
+.optional {
+  color: var(--text-sub);
+  font-weight: 400;
+  font-size: 12px;
+}
+
+.attach-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.btn-attach {
+  border: var(--border-width) solid var(--border-color);
+  background: var(--surface-plain);
+  color: var(--text-sub);
+  border-radius: 8px;
+  padding: 8px 16px;
+  font-size: 13px;
+  cursor: pointer;
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.btn-attach:hover { color: var(--primary); border-color: var(--primary); }
+
+.attach-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--surface-plain);
+  border: 1px solid #e2e8f0;
+  border-radius: 16px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--text-sub);
+  max-width: 100%;
+}
+
+.attach-chip i {
+  color: var(--primary);
+}
+
+.chip-x {
+  border: none;
+  background: transparent;
+  color: var(--text-sub);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+}
+
+.chip-x:hover { color: var(--danger); }
+
+.category-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+}
+
+.category-card {
+  background: var(--surface-plain);
+  border: 2px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 14px 12px;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.category-card:hover:not(.disabled) {
+  border-color: var(--primary);
+}
+
+.category-card.selected {
+  border-color: var(--primary);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+}
+
+.category-card.disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.cat-icon {
+  font-size: 22px;
+}
+
+.cat-name {
+  font-weight: 700;
+  font-size: 14px;
+  color: var(--text-strong);
+  margin: 6px 0 2px;
+}
+
+.cat-desc {
+  font-size: 12px;
+  color: var(--text-sub);
+}
+
+.ban-tip {
+  margin-top: 10px;
+  color: var(--primary);
+  font-size: 13px;
+}
+
+.title-wrap {
+  position: relative;
+}
+
+.title-input {
+  width: 100%;
+  padding: 11px 14px;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.2s;
+  box-sizing: border-box;
+}
+
+.title-input:focus {
+  border-color: var(--primary);
+}
+
+.similar-pop {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 20;
+  background: var(--surface-plain);
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+  margin-top: 4px;
+  overflow: hidden;
+}
+
+.similar-head {
+  padding: 8px 14px;
+  font-size: 12px;
+  color: var(--text-sub);
+  background: var(--surface-plain);
+}
+
+.similar-item {
+  padding: 9px 14px;
+  font-size: 13px;
+  cursor: pointer;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.similar-item:hover {
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+}
+
+.similar-no {
+  color: var(--text-sub);
+  flex-shrink: 0;
+}
+
+.similar-title {
+  color: var(--text-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.content-input {
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  font-size: 14px;
+  font-family: inherit;
+  resize: vertical;
+  outline: none;
+  transition: border-color 0.2s;
+  box-sizing: border-box;
+}
+
+.content-input:focus {
+  border-color: var(--primary);
+}
+
+.error-tip {
+  margin-top: 14px;
+  color: var(--primary);
+  font-size: 13px;
+}
+
+.submit-bar {
+  display: flex;
+  gap: 12px;
+  margin-top: 20px;
+}
+
+.btn-submit {
+  padding: 10px 34px;
+  background: var(--primary);
+  color: #fff;
+  border: none;
+  border-radius: 24px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.btn-submit:hover:not(:disabled) {
+  background: var(--primary-hover);
+}
+
+.btn-submit:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.btn-cancel {
+  padding: 10px 28px;
+  background: var(--bg-subtle);
+  color: var(--text-sub);
+  border: none;
+  border-radius: 24px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+/* ===== 手机端：原本无任何媒体查询 ===== */
+@media (max-width: 600px) {
+  .rules-card {
+    padding: 12px 14px;
+  }
+
+  .category-card {
+    padding: 12px 10px;
+  }
+}
+</style>

@@ -1,0 +1,397 @@
+/* Markdown 样式 - 使用原生CSS代替 @apply */
+.prose {
+  color: var(--text-strong);
+  line-height: 1.7;
+}
+
+.prose h1 {
+  font-size: 1.5rem;
+  font-weight: 700;
+  margin-bottom: 1rem;
+  margin-top: 1.5rem;
+  color: var(--text-strong);
+}
+
+.prose h2 {
+  font-size: 1.25rem;
+  font-weight: 700;
+  margin-bottom: 0.75rem;
+  margin-top: 1.25rem;
+  color: var(--text-strong);
+}
+
+.prose h3 {
+  font-size: 1.125rem;
+  font-weight: 700;
+  margin-bottom: 0.5rem;
+  margin-top: 1rem;
+  color: var(--text-strong);
+}
+
+.prose p {
+  margin-bottom: 1rem;
+  line-height: 1.7;
+}
+
+.prose ul {
+  list-style-type: disc;
+  padding-left: 1.5rem;
+  margin-bottom: 1rem;
+}
+
+.prose ul li {
+  margin-bottom: 0.5rem;
+}
+
+.prose ol {
+  list-style-type: decimal;
+  padding-left: 1.5rem;
+  margin-bottom: 1rem;
+}
+
+.prose ol li {
+  margin-bottom: 0.5rem;
+}
+
+.prose li {
+  line-height: 1.7;
+}
+
+.prose code {
+  background-color: var(--bg-subtle);
+  color: #dc2626;
+  padding: 0.25rem 0.5rem;
+  border-radius: 0.25rem;
+  font-size: 0.875rem;
+  font-family: "JetBrains Mono", "Fira Code", Consolas, Monaco, monospace;
+}
+
+/* 代码块底色/字体与 CodeEditor（oneDark）保持一致 */
+.prose pre {
+  background-color: #282c34;
+  color: #abb2bf;
+  padding: 1rem;
+  border-radius: 6px;
+  border: 1px solid #3a4049;
+  overflow-x: auto;
+  margin-bottom: 1rem;
+}
+
+.prose pre code {
+  background-color: transparent;
+  color: inherit;
+  padding: 0;
+  font-family: "JetBrains Mono", "Fira Code", Consolas, Monaco, monospace;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.prose blockquote {
+  border-left: 4px solid #d1d5db;
+  padding-left: 1rem;
+  font-style: italic;
+  color: var(--text-sub);
+  margin-bottom: 1rem;
+}
+
+.prose table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 1rem;
+}
+
+.prose table th {
+  border: 1px solid #d1d5db;
+  padding: 0.5rem 1rem;
+  background-color: var(--bg-subtle);
+  font-weight: 600;
+}
+
+.prose table td {
+  border: 1px solid #d1d5db;
+  padding: 0.5rem 1rem;
+}
+
+.prose a {
+  color: #2563eb;
+  text-decoration: underline;
+}
+
+.prose a:hover {
+  color: #1d4ed8;
+}
+
+/* @提及：指向用户主页。
+   颜色与普通链接一致，但不加下划线 —— 一条回复里 @ 几个人时下划线太碎。
+   裸 .mention 那条是给通知文案、工单回复这类不套 .prose 的场景用的。 */
+.mention,
+.prose a.mention {
+  color: #2563eb;
+  text-decoration: none;
+}
+
+.mention:hover,
+.prose a.mention:hover {
+  color: #1d4ed8;
+  text-decoration: none;
+}
+
+.prose strong {
+  font-weight: 700;
+  color: var(--text-strong);
+}
+
+.prose em {
+  font-style: italic;
+}
+
+/* 代码高亮配色：直接采用 CodeEditor 的 oneDark 调色板，保证两处观感一致
+   （色值取自 @codemirror/theme-one-dark） */
+.prose .hljs {
+  background-color: transparent;
+  color: #abb2bf;
+}
+
+.prose .hljs-comment,
+.prose .hljs-quote,
+.prose .hljs-meta {
+  color: var(--text-sub);
+}
+
+.prose .hljs-comment,
+.prose .hljs-quote {
+  font-style: italic;
+}
+
+.prose .hljs-keyword,
+.prose .hljs-selector-tag,
+.prose .hljs-subst {
+  color: #c678dd;
+}
+
+.prose .hljs-number,
+.prose .hljs-type,
+.prose .hljs-class .hljs-title,
+.prose .hljs-selector-class {
+  color: #e5c07b;
+}
+
+.prose .hljs-literal,
+.prose .hljs-symbol,
+.prose .hljs-built_in,
+.prose .hljs-builtin-name {
+  color: #d19a66;
+}
+
+.prose .hljs-string,
+.prose .hljs-doctag,
+.prose .hljs-addition {
+  color: #98c379;
+}
+
+.prose .hljs-title,
+.prose .hljs-section,
+.prose .hljs-selector-id,
+.prose .hljs-function {
+  color: #61afef;
+}
+
+.prose .hljs-attr,
+.prose .hljs-attribute,
+.prose .hljs-tag,
+.prose .hljs-name,
+.prose .hljs-selector-attr,
+.prose .hljs-selector-pseudo,
+.prose .hljs-bullet,
+.prose .hljs-deletion {
+  color: #e06c75;
+}
+
+.prose .hljs-regexp,
+.prose .hljs-operator,
+.prose .hljs-link {
+  color: #56b6c2;
+}
+
+.prose .hljs-emphasis {
+  font-style: italic;
+}
+
+.prose .hljs-strong {
+  font-weight: bold;
+}
+
+/* ---------- 代码块容器 ---------- */
+
+/* Markdown 围栏代码块：底色/圆角/边框与 CodeEditor 对齐 */
+.prose .code-block {
+  position: relative;
+  margin-bottom: 1rem;
+  background-color: #282c34;
+  border: 1px solid #3a4049;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+/* 外层容器已负责边框与下边距，避免重复 */
+.prose .code-block pre {
+  margin: 0;
+  border: none;
+  border-radius: 0;
+  background-color: transparent;
+}
+
+/* ---------- 语言标签与复制按钮 ---------- */
+
+/* 右上角工具组：位置与 CodeEditor 的浮动复制按钮一致 */
+.prose .code-tools {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.prose .code-lang {
+  font-family: "JetBrains Mono", "Fira Code", Consolas, Monaco, monospace;
+  font-size: 11px;
+  line-height: 18px;
+  /* 浮在代码首行右上角：给个同款半透明胶囊底，避免和代码文字叠花 */
+  padding: 0 6px;
+  background-color: rgba(255, 255, 255, 0.06);
+  border-radius: 5px;
+  color: var(--text-sub);
+  user-select: none;
+}
+
+/* 基础几何：Markdown 代码块与独立 <pre> 共用（配色见下方各自规则） */
+.code-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  font-size: 11px;
+  line-height: 16px;
+  border-radius: 5px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  opacity: 0.75;
+  transition: opacity 0.15s, background-color 0.15s, color 0.15s;
+}
+
+.code-copy:hover,
+.code-copy:focus-visible {
+  opacity: 1;
+}
+
+/* 深色代码块：与 CodeEditor 的 .ce-copy 同款配色 */
+.prose .code-block .code-copy {
+  color: #abb2bf;
+  background-color: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.16);
+}
+
+.prose .code-block .code-copy:hover {
+  color: #fff;
+  background-color: rgba(255, 255, 255, 0.18);
+}
+
+.prose .code-block .code-copy.is-copied {
+  color: #98c379;
+  border-color: rgba(152, 195, 121, 0.45);
+}
+
+/* 浅色背景上的复制按钮（题面样例 / 评测错误信息）：加 code-copy-light 修饰类 */
+.code-copy-light {
+  color: var(--text-sub);
+  background-color: rgba(100, 116, 139, 0.12);
+  border-color: rgba(100, 116, 139, 0.22);
+}
+
+.code-copy-light:hover {
+  color: var(--text-strong);
+  background-color: rgba(100, 116, 139, 0.22);
+}
+
+.code-copy-light.is-copied {
+color: light-dark(#16a34a, #34d399);
+  opacity: 1;
+}
+
+
+/* ===== 站内嵌 B 站视频（utils/bilibili.ts 生成）===== */
+.bili-embed {
+  position: relative;
+  width: 100%;
+  max-width: 640px;
+  aspect-ratio: 16 / 9;
+  margin: 12px 0;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #000;
+}
+
+.bili-embed iframe {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+
+.bili-embed-caption {
+  position: absolute;
+  right: 8px;
+  bottom: 6px;
+  font-size: 12px;
+  opacity: 0.75;
+  pointer-events: auto;
+}
+
+.bili-embed-caption a {
+  color: #fff;
+  text-decoration: none;
+}
+
+
+/* ===== 站内嵌网易云音乐（utils/netease.ts 生成）===== */
+.netease-embed {
+  position: relative;
+  width: 100%;
+  max-width: 520px;
+  margin: 12px 0;
+}
+
+/* 播放器内部实测：顶部 10px 边距 + 封面 66px（右侧控制区约 90px）≈ 100px，
+   iframe 给 112 不裁底部进度条；歌单/专辑 = 头部卡片 + .list 340px 列表 ≈ 450 */
+.netease-embed iframe {
+  display: block;
+  width: 100%;
+  border: 0;
+  background: var(--surface);
+}
+
+.netease-embed.type-song iframe {
+  height: 112px;
+}
+
+.netease-embed.type-list iframe {
+  height: 460px;
+}
+
+.netease-embed-caption {
+  margin-top: 5px;
+  font-size: 12px;
+  opacity: 0.7;
+}
+
+.netease-embed-caption a {
+  color: var(--primary);
+  text-decoration: none;
+}
+
+.netease-embed-caption a:hover {
+  text-decoration: underline;
+}

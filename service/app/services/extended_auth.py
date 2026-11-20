@@ -1,0 +1,232 @@
+"""扩展认证服务，支持多种登录方式和验证码。"""
+
+from __future__ import annotations
+
+import base64
+import io
+import random
+import string
+from datetime import UTC, datetime
+from typing import Any
+
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+from app.models.user import User
+from app.services.user import allocate_user_number
+
+
+def _load_captcha_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """加载验证码字体：优先系统 TTF，退化到 Pillow 默认字体。"""
+    for path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
+    ):
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def generate_captcha() -> tuple[str, str]:
+    """生成验证码和对应的图片。
+
+    图片在服务端绘制（扭曲字符 + 干扰线 + 噪点），答案绝不返回给客户端，
+    客户端只拿到 base64 PNG。旧版直接返回明文文本，验证码形同虚设。
+
+    Returns:
+        (captcha_text, captcha_image_base64): 验证码文本和 base64 编码的 PNG 图片
+    """
+    chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789'
+    captcha = ''.join(random.choice(chars) for _ in range(5))
+
+    width, height = 140, 44
+    img = Image.new("RGB", (width, height), (247, 248, 250))
+    font = _load_captcha_font(26)
+
+    # 逐字符绘制到独立小图，随机旋转/错位后贴回，增加识别难度
+    for i, ch in enumerate(captcha):
+        char_img = Image.new("RGBA", (30, 36), (0, 0, 0, 0))
+        char_draw = ImageDraw.Draw(char_img)
+        color = (
+            random.randint(40, 130),
+            random.randint(30, 90),
+            random.randint(20, 120),
+        )
+        char_draw.text((2, 2), ch, font=font, fill=color)
+        char_img = char_img.rotate(
+            random.uniform(-25, 25), expand=True, resample=Image.BICUBIC
+        )
+        img.paste(
+            char_img,
+            (
+                8 + i * 25 + random.randint(-2, 2),
+                random.randint(-2, 4),
+            ),
+            char_img,
+        )
+
+    draw = ImageDraw.Draw(img)
+
+    # 干扰线
+    for _ in range(6):
+        draw.line(
+            [
+                (random.randint(0, width), random.randint(0, height)),
+                (random.randint(0, width), random.randint(0, height)),
+            ],
+            fill=(
+                random.randint(80, 180),
+                random.randint(80, 180),
+                random.randint(80, 180),
+            ),
+            width=1,
+        )
+
+    # 噪点
+    for _ in range(120):
+        draw.point(
+            (random.randint(0, width - 1), random.randint(0, height - 1)),
+            fill=(random.randint(0, 200),) * 3,
+        )
+
+    img = img.filter(ImageFilter.SMOOTH)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return captcha.upper(), base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def validate_captcha(user_input: str, expected_captcha: str) -> bool:
+    """验证验证码。
+
+    Args:
+        user_input: 用户输入的验证码
+        expected_captcha: 期望的验证码
+
+    Returns:
+        bool: 验证是否正确
+    """
+    return user_input.strip().upper() == expected_captcha.upper()
+
+
+async def get_email_by_identifier(
+    db: AsyncSession,
+    identifier: str
+) -> str | None:
+    """根据标识符获取用户邮箱。
+
+    支持以下标识符类型：
+    - 手机号 (1[3-9]\\d{9})
+    - 用户编号 (-?\\d{1,6})
+    - 邮箱 (包含@)
+    - 用户名
+
+    Args:
+        db: 数据库会话
+        identifier: 用户标识符
+
+    Returns:
+        用户的邮箱地址，如果未找到则返回 None
+    """
+    # 手机号
+    if _is_phone(identifier):
+        result = await db.execute(
+            select(User.email).where(User.phone == identifier)
+        )
+        return result.scalar_one_or_none()
+
+    # 用户编号
+    if _is_user_number(identifier):
+        result = await db.execute(
+            select(User.email).where(User.user_number == int(identifier))
+        )
+        return result.scalar_one_or_none()
+
+    # 邮箱
+    if '@' in identifier:
+        return identifier
+
+    # 用户名
+    result = await db.execute(
+        select(User.email).where(User.username == identifier)
+    )
+    return result.scalar_one_or_none()
+
+
+def _is_phone(value: str) -> bool:
+    """检查是否为手机号。"""
+    return bool(match := __import__('re').match(r'^1[3-9]\d{9}$', value))
+
+
+def _is_user_number(value: str) -> bool:
+    """检查是否为用户编号。"""
+    try:
+        num = int(value)
+        return -1000000 <= num <= 999999  # 支持6位数编号
+    except (ValueError, TypeError):
+        return False
+
+
+async def create_user_with_number(
+    db: AsyncSession,
+    username: str,
+    email: str,
+    hashed_password: str,
+    phone: str | None = None,
+    **extra_fields: Any
+) -> User:
+    """创建新用户并分配用户编号。
+
+    Args:
+        db: 数据库会话
+        username: 用户名
+        email: 邮箱
+        hashed_password: 哈希后的密码
+        phone: 手机号（可选）
+        **extra_fields: 其他用户字段
+
+    Returns:
+        创建的用户对象
+    """
+    # 顺序分配：取最小未占用的用户编号（从 1 开始递增）
+    user_number = await allocate_user_number(db)
+
+    # 创建新用户
+    user = User(
+        username=username,
+        email=email,
+        hashed_password=hashed_password,
+        phone=phone,
+        user_number=user_number,
+        **extra_fields
+    )
+
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+
+    return user
+
+
+async def check_user_banned(db: AsyncSession, user_id: int) -> bool:
+    """检查用户是否被封禁。
+
+    Args:
+        db: 数据库会话
+        user_id: 用户ID
+
+    Returns:
+        是否被封禁
+    """
+    result = await db.execute(
+        select(User.is_banned).where(User.id == user_id)
+    )
+    is_banned = result.scalar_one_or_none()
+    return bool(is_banned)

@@ -1,0 +1,119 @@
+services:
+  # ===== 后端 FastAPI =====
+  oj-service:
+    build:
+      context: ./service
+      dockerfile: Dockerfile
+    container_name: oj-service
+    restart: unless-stopped
+    expose:
+      - "8000"
+    # 后端配置全部来自 service/.env（在服务器上由 .env.production 复制而来）
+    env_file:
+      - ./service/.env
+    environment:
+      - ENV=prod
+      - HOST=0.0.0.0
+      - PORT=8000
+      # go-judge 评测沙箱地址（宿主机 systemd 服务，经 docker 网桥访问）
+      - GO_JUDGE_URL=http://host.docker.internal:5050
+      # 备用评测机（GO_JUDGE_FALLBACK_URLS）不在这里写死：
+      # 评测机地址属于部署环境信息，由 service/.env 经 env_file 注入，
+      # 见 service/.env.example 的「评测机（go-judge）」一节。
+    extra_hosts:
+      # 让容器内 host.docker.internal 指向宿主机
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # 挂载日志目录
+      - ./service/logs:/app/logs
+      # 挂载上传的静态文件
+      - ./service/static:/app/static
+    networks:
+      - oj-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # ===== 前端 nginx（托管静态文件 + 反代 API） =====
+  oj-web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: oj-web
+    restart: unless-stopped
+    ports:
+      - "8888:80"
+    depends_on:
+      - oj-service
+    networks:
+      - oj-network
+
+  # ===== 自建 PostgreSQL 17（数据自管）=====
+  # 不写 ports：5432 只在 oj-network 内部可达，宿主机与公网均无法连接
+  oj-postgres:
+    image: postgres:17-alpine
+    container_name: oj-postgres
+    restart: unless-stopped
+    env_file:
+      - /var/lib/oj-postgres/pg.env
+    volumes:
+      - /var/lib/oj-postgres/data:/var/lib/postgresql/data
+    networks:
+      - oj-network
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - max_connections=60
+      - -c
+      - timezone=UTC
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 25s
+
+  # ===== Adminer（数据库管理面板）=====
+  # 容器仍只绑宿主回环 127.0.0.1:8080，公网访问一律经 nginx 反代
+  # （入口见 /www/server/panel/vhost/nginx/extension/nlnoj.gr3yph4ntom.cn/adminer_public.conf：
+  #   随机路径 + Basic Auth，口令文件 /var/lib/oj-adminer/htpasswd）
+  # 也可继续用 SSH 隧道: ssh -N -L 8080:127.0.0.1:8080 <账号>@<服务器>
+  # 登录用个人账号（如 ojadmin），权限为 DML-only，非 superuser、无 DDL
+  # ADMINER_SERVERS 不被官方镜像支持，服务器白名单由 login-servers 插件实现（见 volumes）
+  adminer:
+    image: adminer:latest
+    container_name: oj-adminer
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      - ADMINER_DEFAULT_SERVER=oj-postgres
+      - ADMINER_DESIGN=flat
+    volumes:
+      # 官方镜像不支持 ADMINER_SERVERS，改用自带 login-servers 插件锁定服务器与驱动
+      - /var/lib/oj-adminer-plugins/010-login-servers.php:/var/www/html/plugins-enabled/010-login-servers.php:ro
+    depends_on:
+      - oj-postgres
+    networks:
+      - oj-network
+
+networks:
+  oj-network:
+    driver: bridge
+
+# 使用说明:
+# 1. 配置 service/.env（参照 service/.env.production，必须填 DATABASE_URL 和 JWT_SECRET）
+# 2. 运行: docker compose up -d --build
+# 3. 查看日志: docker compose logs -f
+# 4. 停止服务: docker compose down
+# 5. 访问: http://服务器IP/（nginx 80 端口，API 同域反代）
+#
+# 评测沙箱说明:
+# go-judge 以二进制方式部署在宿主机（systemd 服务 go-judge，监听 5050），
+# 容器通过 host.docker.internal:5050 访问。5050 端口未对公网放行，仅容器
+# 经 docker 网桥（172.17.0.1）可达，确保评测服务不被公网滥用。

@@ -1,0 +1,627 @@
+"""工单业务逻辑（参照洛谷工单设计适配本站）。
+
+规则要点：
+- 一事一单：标题须明确具体（由前端引导，后端做长度与重复提示）。
+- 类别权限：封禁用户仅可提交「账号申诉」；未封禁用户不可提交申诉。
+- 公开可见：综合类工单默认公开（登录用户可见），申诉私密（仅创建者与管理员）。
+- 状态流转：管理员回复 → 待补充；用户回复 → 待处理；管理员可挂起/处理中/完成/关闭/删除。
+"""
+
+from __future__ import annotations
+
+from typing import Any, Optional
+
+from sqlalchemy import case, select, func as sa_func
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from app.models.notification import Notification
+from app.models.ticket import Ticket, TicketAttachment, TicketReply
+from app.models.user import User
+from app.schemas.ticket import TICKET_STATUSES
+from app.services.notification import TITLE_MAX, clip, notify_mentions
+from app import permissions as perm
+
+VALID_STATUSES = set(TICKET_STATUSES.keys())
+
+OPEN_STATUSES = {"pending", "replied", "processing", "suspended"}
+
+
+class TicketService:
+    """工单服务"""
+
+    @classmethod
+    async def create_ticket(
+        cls,
+        db: AsyncSession,
+        creator: User,
+        title: str,
+        category: str,
+        content: str,
+    ) -> Ticket:
+        """创建工单。
+
+        规则：
+        - 封禁用户仅可提交「账号申诉」（appeal）
+        - 未封禁用户不可提交「账号申诉」
+        - 题目投递工单已下线，请通过题目审核系统提交
+        """
+        if category == "problem_submit":
+            raise PermissionError("题目投递工单板块已下线，请通过侧边栏「题目审核」或题目管理提交公开审核")
+        if creator.is_banned and category != "appeal":
+            raise PermissionError("被封禁的用户仅可提交「账号申诉」工单")
+        if not creator.is_banned and category == "appeal":
+            raise PermissionError("账号申诉工单仅封禁用户可提交")
+
+        # 每人同时最多 10 张未完结工单，防止刷工单
+        open_count_result = await db.execute(
+            select(sa_func.count()).select_from(Ticket).where(
+                Ticket.creator_id == creator.id,
+                Ticket.status.in_(OPEN_STATUSES),
+            )
+        )
+        if (open_count_result.scalar() or 0) >= 10:
+            raise PermissionError("你有 10 张未完结的工单，请等待处理完成后再提交")
+
+        is_public = category != "appeal"
+
+        ticket = Ticket(
+            title=title.strip(),
+            category=category,
+            status="pending",
+            creator_id=creator.id,
+            is_public=is_public,
+        )
+        db.add(ticket)
+        await db.flush()
+
+        reply = TicketReply(
+            ticket_id=ticket.id,
+            user_id=creator.id,
+            content=content.strip(),
+            is_staff=False,
+        )
+        db.add(reply)
+        ticket.last_reply_at = reply.created_at
+        ticket.last_reply_by = "user"
+
+        await db.commit()
+        await db.refresh(ticket)
+        return ticket
+
+    @staticmethod
+    def _user_brief(user: User | None) -> dict[str, Any]:
+        if user is None:
+            return {
+                "user_id": None,
+                "username": "已删除用户",
+                "user_tag": "",
+                "is_admin": False,
+                "is_super_admin": False,
+                "is_banned": False,
+                "is_cheater": False,
+                "can_manage_users": False,
+                "can_manage_posts": False,
+                "can_manage_problems": False,
+                "color_tier": "gray",
+                "name_color": "",
+                "user_number": None,
+                "avatar_url": "",
+            }
+        return {
+            "user_id": user.id,
+            "username": user.username,
+            "user_tag": user.display_tag,
+            "is_admin": bool(user.is_admin),
+            "is_super_admin": bool(user.is_super_admin),
+            "is_banned": bool(user.is_banned),
+            "is_cheater": bool(user.is_cheater),
+            "can_manage_users": bool(user.can_manage_users),
+            "can_manage_posts": bool(user.can_manage_posts),
+            "can_manage_problems": bool(user.can_manage_problems),
+            "color_tier": user.color_tier or "gray",
+            "name_color": user.name_color,
+            "user_number": user.user_number,
+            "avatar_url": user.avatar_url or "",
+        }
+
+    @staticmethod
+    def _ticket_dict(ticket: Ticket) -> dict[str, Any]:
+        return {
+            "id": ticket.id,
+            "ticket_no": f"#{1000 + ticket.id}",
+            "title": ticket.title,
+            "category": ticket.category,
+            "status": ticket.status,
+            "creator_id": ticket.creator_id,
+            "is_public": ticket.is_public,
+            "last_reply_at": ticket.last_reply_at.isoformat() if ticket.last_reply_at else None,
+            "last_reply_by": ticket.last_reply_by,
+            "created_at": ticket.created_at.isoformat() if ticket.created_at else None,
+            "updated_at": ticket.updated_at.isoformat() if ticket.updated_at else None,
+            "creator": TicketService._user_brief(ticket.creator),
+            "assignee": TicketService._user_brief(ticket.assignee) if ticket.assignee_id else None,
+        }
+
+    @staticmethod
+    async def list_tickets(
+        db: AsyncSession,
+        *,
+        scope: str = "my",
+        creator_id: Optional[int] = None,
+        assignee_id: Optional[int] = None,
+        status: Optional[str] = None,
+        category: Optional[str] = None,
+        page: int = 0,
+        page_size: int = 20,
+        include_private: bool = True,
+    ) -> dict[str, Any]:
+        """工单列表。
+
+        scope=my          → 只看自己的
+        scope=all         → 全部公开工单（删除态不可见）；
+                            include_private=True（管理员）时额外可见账号申诉等私密工单
+        scope=assigned    → 责任人为当前用户、且未完结（不含已完成/已关闭/已删除）
+        scope=unassigned  → 尚无责任人、且未完结（不含已完成/已关闭/已删除）
+        """
+        query = select(Ticket).options(selectinload(Ticket.creator))
+
+        if scope == "assigned" and assignee_id is not None:
+            query = query.where(
+                Ticket.assignee_id == assignee_id,
+                Ticket.status.in_(OPEN_STATUSES),
+            )
+        elif scope == "unassigned":
+            query = query.where(
+                Ticket.assignee_id.is_(None),
+                Ticket.status.in_(OPEN_STATUSES),
+            )
+        elif scope == "my" and creator_id is not None:
+            query = query.where(Ticket.creator_id == creator_id)
+        else:
+            query = query.where(Ticket.status != "deleted")
+            if not include_private:
+                query = query.where(Ticket.is_public.is_(True))
+
+        if status:
+            query = query.where(Ticket.status == status)
+        if category:
+            query = query.where(Ticket.category == category)
+
+        total_result = await db.execute(
+            select(sa_func.count()).select_from(query.subquery())
+        )
+        total = total_result.scalar() or 0
+
+        # 已完成 / 已关闭 排到列表后面，避免翻页麻烦
+        closed_priority = case(
+            (Ticket.status.in_(["resolved", "closed"]), 1),
+            else_=0,
+        )
+        result = await db.execute(
+            query.order_by(
+                closed_priority.asc(),
+                Ticket.last_reply_at.desc().nullslast(),
+                Ticket.id.desc(),
+            )
+            .offset(page * page_size)
+            .limit(page_size)
+        )
+        tickets = result.scalars().unique().all()
+
+        return {
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "tickets": [TicketService._ticket_dict(t) for t in tickets],
+        }
+
+    @staticmethod
+    async def search_similar(
+        db: AsyncSession,
+        title: str,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """按标题模糊搜索公开工单（相似工单查询）。"""
+        keyword = (title or "").strip()
+        if len(keyword) < 2:
+            return []
+        result = await db.execute(
+            select(Ticket)
+            .options(selectinload(Ticket.creator))
+            .where(
+                Ticket.is_public.is_(True),
+                Ticket.status != "deleted",
+                Ticket.title.ilike(f"%{keyword}%"),
+            )
+            .order_by(Ticket.id.desc())
+            .limit(limit)
+        )
+        return [TicketService._ticket_dict(t) for t in result.scalars().unique().all()]
+
+    @staticmethod
+    async def get_ticket(db: AsyncSession, ticket_id: int) -> Optional[Ticket]:
+        result = await db.execute(
+            select(Ticket)
+            .options(
+                selectinload(Ticket.creator),
+                selectinload(Ticket.assignee),
+                selectinload(Ticket.replies).selectinload(TicketReply.user),
+                selectinload(Ticket.replies).selectinload(TicketReply.action_target),
+            )
+            .where(Ticket.id == ticket_id)
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    def can_view(ticket: Ticket, user: Optional[User]) -> bool:
+        """可见性：创建者 / 管理员 / 公开工单的任意登录用户。"""
+        if user is None:
+            return False
+        if ticket.creator_id == user.id:
+            return True
+        if user.can_manage_users or user.is_admin or user.is_super_admin:
+            return True
+        return bool(ticket.is_public) and ticket.status != "deleted"
+
+    @staticmethod
+    def is_staff_user(user: User) -> bool:
+        # 工单管理归社管：走真源 can_manage_community（白名单/超管/社管）
+        return perm.can_manage_community(user)
+
+    @staticmethod
+    async def notify(
+        db: AsyncSession,
+        user_id: int,
+        ntype: str,
+        content: str,
+        ticket_id: int,
+        actor_id: int,
+        force: bool = False,
+        link: str | None = None,
+    ) -> None:
+        """写入站内通知（默认操作者本人不通知；force=True 时强制通知，如指派给自己）。"""
+        if user_id == actor_id and not force:
+            return
+        db.add(Notification(
+            user_id=user_id,
+            type=ntype,
+            content=clip(content),
+            ticket_id=ticket_id,
+            actor_id=actor_id,
+            link=link or f"/tickets/{ticket_id}",
+        ))
+
+    @staticmethod
+    async def add_reply(
+        db: AsyncSession,
+        ticket: Ticket,
+        user: User,
+        content: str,
+    ) -> TicketReply:
+        """追加回复。
+
+        - 公开工单：任何登录用户都可评论，但须处于未完结状态（pending/replied/processing/suspended）
+        - 私密工单（账号申诉）：仅创建者与管理员可回复
+        - 状态流转：管理员回复 → 待补充；创建者回复 → 待处理；第三方评论不改变状态
+        """
+        is_staff = TicketService.is_staff_user(user)
+        is_creator = ticket.creator_id == user.id
+
+        # 私密工单（账号申诉）仅创建者与管理员可回复
+        if not ticket.is_public and not (is_staff or is_creator):
+            raise PermissionError("申诉类工单仅创建者与管理员可回复")
+        # 非管理员须在工单未完结时回复
+        if not is_staff and ticket.status not in OPEN_STATUSES:
+            raise PermissionError("工单已完结，如仍有问题请新建工单")
+
+        reply = TicketReply(
+            ticket_id=ticket.id,
+            user_id=user.id,
+            content=content.strip(),
+            is_staff=is_staff,
+        )
+        db.add(reply)
+        ticket.last_reply_at = reply.created_at
+        ticket.last_reply_by = "staff" if is_staff else "user"
+
+        # 非创建者回复（管理员处理或普通用户评论）→ 通知工单创建者
+        title = clip(ticket.title, TITLE_MAX)
+        if not is_creator:
+            await TicketService.notify(
+                db,
+                ticket.creator_id,
+                "reply",
+                f"@{user.username} 回复了你的工单「{title}」，快来看看吧",
+                ticket.id,
+                user.id,
+            )
+        # 回复正文里的 @ → 提及通知。与「被回复」分开：
+        # 被 @ 只代表提及，不代表对方回复了你
+        await notify_mentions(
+            db, reply.content, actor=user, link=f"/tickets/{ticket.id}",
+            where=f"工单「{title}」",
+        )
+        # 状态流转规则：
+        # - 管理员回复：仅当工单处于「待处理」时流转为「待补充」，其他状态保持不变
+        # - 用户回复：开放状态下流转回「待处理」
+        if is_staff:
+            if ticket.status == "pending":
+                ticket.status = "replied"
+        elif is_creator and ticket.status in OPEN_STATUSES:
+            ticket.status = "pending"
+
+        await db.commit()
+        await db.refresh(reply)
+        return reply
+
+    @staticmethod
+    async def update_title(
+        db: AsyncSession,
+        ticket: Ticket,
+        user: User,
+        title: str,
+    ) -> None:
+        """修改工单标题（创建者或管理员；工单未完结时创建者可改，管理员随时可改）。
+
+        在时间线留下动作记录：将标题从「旧」修改为「新」。
+        """
+        title = (title or "").strip()
+        if not (2 <= len(title) <= 100):
+            raise ValueError("标题长度须在 2~100 字之间")
+        is_staff = TicketService.is_staff_user(user)
+        is_creator = ticket.creator_id == user.id
+        if not (is_creator or is_staff):
+            raise PermissionError("只有创建者或管理员可以修改标题")
+        if not is_staff and ticket.status not in OPEN_STATUSES:
+            raise PermissionError("工单已完结，标题不可修改")
+
+        old_title = ticket.title
+        if title == old_title:
+            return
+        ticket.title = title
+        # 动作记录（前端渲染为「某某 将标题从 旧 修改为 新」）
+        db.add(TicketReply(
+            ticket_id=ticket.id,
+            user_id=user.id,
+            content="",
+            is_staff=is_staff,
+            action_text=f"将标题从「{old_title}」修改为「{title}」",
+        ))
+        await db.commit()
+
+    @staticmethod
+    def _attachment_dict(att) -> dict[str, Any]:
+        return {
+            "id": att.id,
+            "reply_id": att.reply_id,
+            "orig_name": att.orig_name,
+            "stored_path": att.stored_path,
+            "size_bytes": att.size_bytes,
+            "uploader_id": att.uploader_id,
+        }
+
+    @staticmethod
+    async def get_total_attachment_size(
+        db: AsyncSession, ticket_id: int
+    ) -> int:
+        """该工单全部附件（描述 + 各回复）的字节总和。"""
+        total = (await db.execute(
+            select(sa_func.coalesce(sa_func.sum(TicketAttachment.size_bytes), 0)).where(
+                TicketAttachment.ticket_id == ticket_id
+            )
+        )).scalar_one()
+        return int(total or 0)
+
+    async def add_attachment(
+        db: AsyncSession,
+        ticket: Ticket,
+        user: User,
+        reply_id: Optional[int],
+        orig_name: str,
+        stored_path: str,
+        size_bytes: int,
+    ) -> "TicketAttachment":
+        """为工单添加附件。
+
+        reply_id 为空时自动挂到工单描述（首条回复）；上传者须为创建者或
+        管理员，且工单未完结。
+        """
+        is_staff = TicketService.is_staff_user(user)
+        is_creator = ticket.creator_id == user.id
+        if not (is_creator or is_staff):
+            raise PermissionError("只有创建者或管理员可以上传附件")
+        if not is_staff and ticket.status not in OPEN_STATUSES:
+            raise PermissionError("工单已完结，附件不可上传")
+
+        if reply_id is None:
+            if not ticket.replies:
+                raise ValueError("工单缺少描述，无法挂载附件")
+            reply_id = ticket.replies[0].id
+        else:
+            reply = (await db.execute(
+                select(TicketReply).where(
+                    TicketReply.id == reply_id,
+                    TicketReply.ticket_id == ticket.id,
+                )
+            )).scalar_one_or_none()
+            if reply is None:
+                raise ValueError("回复不存在")
+
+        att = TicketAttachment(
+            ticket_id=ticket.id,
+            reply_id=reply_id,
+            uploader_id=user.id,
+            orig_name=(orig_name or "附件")[:255],
+            stored_path=stored_path,
+            size_bytes=size_bytes,
+        )
+        db.add(att)
+        await db.commit()
+        await db.refresh(att)
+        return att
+
+    @staticmethod
+    async def delete_attachment(
+        db: AsyncSession,
+        ticket: Ticket,
+        user: User,
+        attachment_id: int,
+    ) -> None:
+        """删除附件（上传者本人或管理员）。返回被删附件的存储路径。"""
+        att = (await db.execute(
+            select(TicketAttachment).where(
+                TicketAttachment.id == attachment_id,
+                TicketAttachment.ticket_id == ticket.id,
+            )
+        )).scalar_one_or_none()
+        if att is None:
+            raise ValueError("附件不存在")
+        if att.uploader_id != user.id and not TicketService.is_staff_user(user):
+            raise PermissionError("只有上传者本人或管理员可以删除附件")
+
+        path = att.stored_path
+        await db.delete(att)
+        await db.commit()
+        return path
+
+    @staticmethod
+    async def update_description(
+        db: AsyncSession,
+        ticket: Ticket,
+        user: User,
+        content: str,
+    ) -> None:
+        """编辑工单描述（即创建时的首条内容，仅创建者、工单未完结时可改）。"""
+        if ticket.creator_id != user.id:
+            raise PermissionError("只有创建者可以编辑工单描述")
+        if ticket.status not in OPEN_STATUSES:
+            raise PermissionError("工单已完结，描述不可修改")
+        if not ticket.replies:
+            raise ValueError("工单缺少描述")
+
+        ticket.replies[0].content = content.strip()
+        # 动作记录（前端渲染为「某某 修改了工单内容」）
+        db.add(TicketReply(
+            ticket_id=ticket.id,
+            user_id=user.id,
+            content="",
+            is_staff=TicketService.is_staff_user(user),
+            action_text="修改了工单内容",
+        ))
+        await db.commit()
+
+    @staticmethod
+    async def assign(
+        db: AsyncSession,
+        ticket: Ticket,
+        operator: User,
+        assignee: Optional[User],
+    ) -> None:
+        """指派/更改/取消责任人（仅管理员）。
+
+        - assignee 为 None 表示取消指派
+        - 被指派人必须具备用户管理权限
+        - 留下时间线记录
+        """
+        if not TicketService.is_staff_user(operator):
+            raise PermissionError("需要用户管理权限")
+        if assignee is not None and not TicketService.is_staff_user(assignee):
+            raise PermissionError("责任人必须是具备用户管理权限的管理员")
+
+        ticket.assignee_id = assignee.id if assignee else None
+
+        action = (
+            f"将责任人指派为 {assignee.username}" if assignee
+            else "取消了责任人"
+        )
+        db.add(TicketReply(
+            ticket_id=ticket.id,
+            user_id=operator.id,
+            content="",
+            is_staff=True,
+            action_text=action,
+            action_target_user_id=assignee.id if assignee else None,
+        ))
+        # 通知工单创建者与被指派人（指派给自己时也强制通知留痕）
+        await TicketService.notify(
+            db,
+            ticket.creator_id,
+            "assign",
+            f"你的「{ticket.title}」工单{action}，快来看看吧",
+            ticket.id,
+            operator.id,
+            force=True,
+        )
+        if assignee:
+            await TicketService.notify(
+                db,
+                assignee.id,
+                "assign",
+                f"你被 {operator.username} 指派为「{ticket.title}」工单的责任人，快来看看吧",
+                ticket.id,
+                operator.id,
+                force=True,
+            )
+        await db.commit()
+        await db.refresh(ticket)
+
+    @staticmethod
+    async def list_staff(db: AsyncSession) -> list[dict[str, Any]]:
+        """可被指派为责任人的管理员列表。"""
+        result = await db.execute(
+            select(User).where(
+                (User.can_manage_users.is_(True))
+                | (User.is_admin.is_(True))
+                | (User.is_super_admin.is_(True))
+            ).order_by(User.id)
+        )
+        return [TicketService._user_brief(u) for u in result.scalars().all()]
+
+    @staticmethod
+    async def update_status(
+        db: AsyncSession,
+        ticket: Ticket,
+        user: User,
+        new_status: str,
+    ) -> Ticket:
+        """管理员流转状态；创建者仅可关闭自己的工单。"""
+        if new_status not in VALID_STATUSES:
+            raise ValueError("无效的状态")
+
+        is_staff = TicketService.is_staff_user(user)
+        is_creator = ticket.creator_id == user.id
+
+        if is_staff:
+            ticket.status = new_status
+        elif is_creator:
+            if new_status != "closed":
+                raise PermissionError("创建者仅可关闭自己的工单")
+            if ticket.status in ("closed", "deleted"):
+                raise PermissionError("工单已完结")
+            ticket.status = "closed"
+        else:
+            raise PermissionError("无权限操作该工单")
+
+        # 留下状态变更记录（存纯状态名，前端渲染为「某某 将工单状态设置为 已完成」）
+        action = TICKET_STATUSES.get(new_status, new_status)
+        db.add(TicketReply(
+            ticket_id=ticket.id,
+            user_id=user.id,
+            content="",
+            is_staff=is_staff,
+            action_text=action,
+        ))
+        # 通知工单创建者（操作者本人除外）
+        await TicketService.notify(
+            db,
+            ticket.creator_id,
+            "status",
+            f"你的「{ticket.title}」工单被 {user.username} 设置成「{action}」状态，快来看看吧",
+            ticket.id,
+            user.id,
+        )
+
+        await db.commit()
+        await db.refresh(ticket)
+        return ticket

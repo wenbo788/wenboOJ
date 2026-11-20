@@ -1,0 +1,82 @@
+"""Async SQLAlchemy engine, session factory, and request-scoped dependency.
+
+Backend is chosen by DATABASE_URL: PostgreSQL (asyncpg) in production, SQLite
+(aiosqlite) for local dev/testing. The same ORM models and migrations work on
+both.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import AsyncGenerator
+
+from sqlalchemy import event
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+
+from app.core.config import settings
+
+_IS_SQLITE = settings.DATABASE_URL.startswith("sqlite")
+
+
+def _json_serializer(value) -> str:
+    # ensure_ascii=False：JSON 列里的中文按原文存储（而非 \uXXXX 转义），
+    # 这样题库标签的 cast-to-text LIKE 筛选才能命中。
+    return json.dumps(value, ensure_ascii=False)
+
+
+_engine_kwargs: dict = {
+    "echo": False,
+    "pool_pre_ping": True,
+    "json_serializer": _json_serializer,
+}
+if _IS_SQLITE:
+    # SQLite connections are file-locked and cheap; allow async access from any
+    # worker thread.
+    _engine_kwargs["connect_args"] = {"check_same_thread": False}
+else:
+    # 生产（PostgreSQL）。这组数字是「被打时还能服务」的关键，不是随手填的：
+    # - pool_timeout 从默认 30s 收到 5s：连接池排满时让请求**快速失败**
+    #   （main.py 把 TimeoutError 转成 503），而不是挂着等 30s——排队干等
+    #   正是 Cloudflare 报 522 的直接原因；
+    # - pool_recycle 定期回收长连接，避免云上 NAT/防火墙静默断链后的坏连接；
+    # - 上限（10+20）要小于 PostgreSQL 的 max_connections，为运维留出余量。
+    _engine_kwargs.update(
+        pool_size=10, max_overflow=20, pool_timeout=5, pool_recycle=1800
+    )
+
+engine = create_async_engine(settings.DATABASE_URL, **_engine_kwargs)
+
+if _IS_SQLITE:
+    # SQLite disables foreign-key enforcement by default; turn it on so
+    # ON DELETE CASCADE works. Registered on the sync engine behind the async one.
+    @event.listens_for(engine.sync_engine, "connect")
+    def _enable_sqlite_fk(dbapi_conn, _record):  # pragma: no cover
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA foreign_keys=ON")
+        cur.close()
+
+
+AsyncSessionLocal = async_sessionmaker(
+    engine,
+    class_=AsyncSession,
+    expire_on_commit=False,  # critical for async: post-commit attr access must not lazy-load
+    autoflush=False,
+)
+
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """Yield a request-scoped async session; rollback on error.
+
+    No auto-commit at the end of the dependency: services commit explicitly
+    after writes, so read-only endpoints never open a write transaction.
+    """
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+        except Exception:
+            await session.rollback()
+            raise

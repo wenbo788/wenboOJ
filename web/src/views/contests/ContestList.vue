@@ -1,0 +1,154 @@
+<script setup lang="ts">
+import { ref, computed, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
+import { useAuthStore } from '@/stores/auth'
+import { contestsApi, type ContestItem } from '@/api/contests'
+import { fmtDateTime } from '@/utils/datetime'
+import { canManageProblems } from '@/utils/permissions'
+
+const router = useRouter()
+const authStore = useAuthStore()
+const isLoggedIn = computed(() => authStore.isAuthenticated)
+const canManage = computed(() => canManageProblems(authStore.currentUser))
+
+const contests = ref<ContestItem[]>([])
+const loading = ref(true)
+const error = ref('')
+
+const load = async () => {
+  loading.value = true
+  try {
+    const data = await contestsApi.list()
+    contests.value = data.items
+  } catch (err: any) {
+    error.value = err.response?.data?.detail || err.message || '加载失败'
+  } finally {
+    loading.value = false
+  }
+}
+
+const STATUS: Record<string, { text: string; cls: string }> = {
+  running: { text: '进行中', cls: 'running' },
+  pending: { text: '未开始', cls: 'pending' },
+  ended: { text: '已结束', cls: 'ended' },
+}
+// 比赛时间要按用户本地时区展示。
+// 以前这里是 iso.slice(0, 16)，把后端带回的 UTC 时刻直接当本地时间显示，
+// 于是「显示 14:00 结束」实际是 UTC 14:00（北京时间 22:00）——
+// 状态判定用的是真实 UTC，两边就对不上了，看着像比赛结束时间没生效。
+const fmt = (iso: string | null) => fmtDateTime(iso, '—')
+
+const RULE_LABELS: Record<string, string> = {
+  xcpc: 'XCPC',
+  acm: 'XCPC',
+  oi: 'OI',
+  ioi: 'IOI',
+}
+const ruleLabel = (rt?: string) => RULE_LABELS[rt || 'xcpc'] || 'XCPC'
+const ruleBadgeClass = (rt?: string) => `rule-${rt === 'acm' ? 'xcpc' : rt || 'xcpc'}`
+
+onMounted(load)
+</script>
+
+<template>
+  <div class="contests-page">
+    <div class="contests-container">
+      <div class="page-head">
+        <h2 class="page-title">比赛</h2>
+        <button v-if="isLoggedIn" class="btn-primary" @click="router.push('/contests/new')"><i class="fa-solid fa-plus"></i> 创建比赛</button>
+      </div>
+
+      <div v-if="loading" class="empty">加载中...</div>
+      <div v-else-if="error" class="empty">{{ error }}</div>
+      <div v-else-if="contests.length === 0" class="empty">还没有比赛</div>
+
+      <div v-else class="contest-list">
+        <div
+          v-for="c in contests"
+          :key="c.id"
+          class="contest-card"
+          @click="router.push(`/contest/${c.id}`)"
+        >
+          <div class="c-main">
+            <div class="c-title-row">
+              <span class="c-title">{{ c.title }}</span>
+              <span class="status-badge" :class="STATUS[c.status].cls">{{ STATUS[c.status].text }}</span>
+              <span class="type-badge">{{ c.type_label }}</span>
+              <span class="rule-badge" :class="ruleBadgeClass(c.rule_type)">{{ ruleLabel(c.rule_type) }}</span>
+              <span v-if="c.is_team_contest" class="team-contest-badge"><i class="fa-solid fa-users"></i> 组队赛 ({{ c.max_team_members || 3 }}人)</span>
+            </div>
+            <div v-if="c.description" class="c-desc">{{ c.description }}</div>
+            <div class="c-meta">
+              <span><i class="fa-solid fa-stopwatch"></i> {{ fmt(c.start_time) }} ~ {{ fmt(c.end_time) }}</span>
+              <span><i class="fa-solid fa-clipboard-list"></i> {{ c.problem_count }} 题</span>
+              <span><i class="fa-solid fa-user-group"></i> {{ c.participant_count }} 人报名</span>
+              <span v-if="c.is_team_contest"><i class="fa-solid fa-people-group"></i> {{ c.team_count || 0 }} 支队伍</span>
+              <span>发起人：<b>{{ c.owner.username }}</b></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.contests-page { min-height: calc(100vh - 60px); }
+.contests-container { max-width: 900px; margin: 0 auto; padding: 24px 20px; }
+.page-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+.page-title { color: var(--primary); font-size: 22px; margin: 0; }
+
+.contest-list { display: flex; flex-direction: column; gap: 12px; }
+.contest-card { background: var(--surface); -webkit-backdrop-filter: blur(var(--surface-blur)) saturate(1.5); backdrop-filter: blur(var(--surface-blur)) saturate(1.5); border: var(--border-width) solid var(--border-color); border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,.05); padding: 16px 20px; cursor: pointer; transition: transform .12s, box-shadow .12s; }
+.contest-card:hover { transform: translateY(-1px); box-shadow: 0 5px 14px rgba(0,0,0,.09); }
+.c-title-row { display: flex; align-items: center; gap: 10px; }
+.type-badge { font-size: 12px; padding: 2px 10px; border-radius: 4px;color: var(--primary-text); background: color-mix(in srgb, var(--primary) 8%, transparent); font-weight: 600; }
+.rule-badge { font-size: 12px; padding: 2px 10px; border-radius: 4px; font-weight: 600; }
+.rule-badge.rule-xcpc {color: var(--primary-text); background: color-mix(in srgb, var(--primary) 8%, transparent); }
+.rule-badge.rule-oi {color: var(--warning-text); background: color-mix(in srgb, var(--warning) 12%, transparent); }
+.rule-badge.rule-ioi {color: var(--success-text); background: color-mix(in srgb, var(--success) 10%, transparent); }
+.team-contest-badge { font-size: 12px; padding: 2px 10px; border-radius: 4px; font-weight: 600; color: #722ed1; background: color-mix(in srgb, #722ed1 10%, transparent); }
+.c-title { font-size: 16px; font-weight: 700; color: var(--text-strong); }
+.status-badge { font-size: 12px; padding: 2px 12px; border-radius: 20px; font-weight: 600; }
+.status-badge.running { color: #fff; background: #52c41a; }
+.status-badge.pending { color: #fff; background: #f39c11; }
+.status-badge.ended { color: #8e9aaf; background: var(--bg-subtle); }
+.c-desc { margin-top: 6px; color: #8e9aaf; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.c-meta { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px 18px; color: var(--text-sub); font-size: 13px; }
+.c-meta b { color: var(--text-strong); }
+
+.btn-primary { background: var(--primary); color: #fff; border: none; border-radius: 8px; padding: 8px 20px; font-weight: 600; cursor: pointer; font-size: 14px; }
+.btn-secondary { background: var(--bg-subtle); color: var(--text-strong); border: none; border-radius: 8px; padding: 8px 20px; font-weight: 600; cursor: pointer; font-size: 14px; }
+.empty { text-align: center; color: var(--text-sub); padding: 48px 0; background: var(--surface); -webkit-backdrop-filter: blur(var(--surface-blur)) saturate(1.5); backdrop-filter: blur(var(--surface-blur)) saturate(1.5); border: var(--border-width) solid var(--border-color); border-radius: 12px; }
+
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 999; display: flex; justify-content: center; align-items: center; }
+.modal-box { background: var(--surface-plain); border-radius: 14px; width: 92%; max-width: 560px; max-height: 88vh; overflow-y: auto; padding: 24px 28px; }
+.modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+.modal-header h3 { margin: 0; font-size: 18px; color: var(--text-strong); }
+.modal-close { background: none; border: none; font-size: 20px; color: #8e9aaf; cursor: pointer; }
+.form-item { display: block; margin-bottom: 12px; }
+.form-label { display: block; font-size: 13px; font-weight: 600; color: var(--text-strong); margin-bottom: 6px; }
+.form-input { width: 100%; box-sizing: border-box; padding: 8px 12px; border: 1px solid #dce0e6; border-radius: 8px; font-size: 14px; outline: none; font-family: inherit; resize: vertical; }
+.form-input:focus { border-color: var(--primary); }
+.form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.pool { max-height: 200px; overflow-y: auto; border: 1px solid #eef1f5; border-radius: 8px; padding: 8px 12px; display: flex; flex-direction: column; gap: 4px; }
+.pool-item { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-strong); cursor: pointer; }
+.pool-item input { accent-color: var(--primary); }
+.hint { font-size: 13px; color: #8e9aaf; }
+.form-error { color: #e74c3c; font-size: 13px; margin-top: 8px; }
+.modal-footer { display: flex; justify-content: flex-end; gap: 12px; margin-top: 10px; }
+
+/* ===== 手机端：容器横向内边距归零 =====
+   这些页面的 .xxx-container 自己写了 padding，会和 App.vue 的 .main-content
+   页边距叠加（手机上变成 16+20=36px/侧）。容器不再重复留白。 */
+@media (max-width: 600px) {
+  .contests-container {
+    padding: 16px 0;
+  }
+
+  .contest-card {
+    padding: 14px;
+  }
+}
+</style>

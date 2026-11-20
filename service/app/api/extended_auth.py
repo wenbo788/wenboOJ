@@ -1,0 +1,792 @@
+"""扩展认证API：支持验证码登录和多种登录方式。"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import re
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import JSONResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = logging.getLogger(__name__)
+
+from app.core.database import get_db
+from app.core.config import settings
+from app.schemas.user import UserLogin, UserCreate
+from app.schemas.auth import TokenResponse
+from app.services import auth as auth_service
+from app.services.extended_auth import (
+    generate_captcha,
+    validate_captcha,
+    get_email_by_identifier,
+    create_user_with_number,
+    check_user_banned
+)
+from app.core.security import hash_password
+from app.deps import get_current_user
+from app.models.user import User
+from app.services.email_verification import (
+    generate_verification_code,
+    generate_email_token,
+    store_verification_code,
+    verify_code,
+    delete_verification_code,
+    get_verification_email,
+    generate_password_reset_token,
+    store_password_reset_token,
+    verify_password_reset_token,
+    mark_password_reset_token_used,
+    delete_password_reset_token
+)
+from app.services.email_service import email_service
+from app.utils.ratelimit import check
+from app.utils.ip import get_client_ip
+
+router = APIRouter(prefix="/auth", tags=["extended-auth"])
+
+
+# 存储验证码的内存缓存（生产环境应使用 Redis）
+_captcha_store: dict[str, dict[str, Any]] = {}
+
+
+# 发信验证码的限流参数。这个接口无需登录且会把邮件真发出去，不设限等于对外
+# 提供了一个免费的邮件发送工具，SMTP 账号很快会被判定「异常发信」而封禁。
+#
+# 早期版本因 XFF 可伪造而故意不做按 IP 限制；现容器 nginx 已透传宝塔覆盖写入
+# 的 X-Real-IP（不可伪造，见 web/nginx.conf 与 app/utils/ip.py），按 IP 限流
+# 重新生效，与邮箱维度、全站额度三道并存。
+#
+# 注意：这个值必须与前端注册页的倒计时一致（Register.vue 里 countdown = 60），
+# 否则前端倒计时结束、服务端还在冷却，用户会莫名吃 429。
+# 全站/单邮箱的额度在 config.py 里，方便开学注册高峰临时调大。
+_SEND_EMAIL_COOLDOWN_SECONDS = 60
+
+# 匿名接口的按 IP 限流阈值（正常用户远达不到，攻击脚本则会被卡住）
+_IP_LIMIT_LOGIN = (10, 60)          # 登录：10 次/分钟（防撞库）
+_IP_LIMIT_REGISTER = (5, 86400)     # 注册：5 次/天（批量造小号直接卡死）
+_IP_LIMIT_SEND_VERIFY = (5, 3600)   # 发验证码：5 次/小时
+_IP_LIMIT_PWD_RESET = (5, 3600)     # 忘记密码：5 次/小时
+
+
+def _check_ip_limit(request: Request, action: str, limit: tuple[int, int]) -> None:
+    """按「客户端真实 IP + 动作」限流，超限抛 429。"""
+    max_requests, window = limit
+    ok, wait = check(f"ip:{action}:{get_client_ip(request)}", max_requests, window)
+    if not ok:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"请求过于频繁，请 {wait} 秒后再试",
+        )
+
+
+async def _is_disposable_email(email: str) -> bool:
+    """查询 disposablemail.io 判断是否临时/一次性邮箱。
+
+    响应文本包含 "is a temporary email address" 即判定为临时邮箱。
+    检测服务不可达时放行（记日志），避免第三方故障阻断正常注册。
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+            resp = await client.get(f"https://disposablemail.io/email/{email}")
+            return "is a temporary email address" in resp.text
+    except Exception as e:
+        logger.warning("临时邮箱检测服务不可用，放行 %s: %s", email, e)
+        return False
+
+
+def generate_captcha_id() -> str:
+    """生成验证码会话ID。"""
+    return hashlib.sha256(str(datetime.now().timestamp()).encode()).hexdigest()[:16]
+
+
+@router.get("/email-config-test", summary="测试邮箱配置")
+async def test_email_config(
+    current_user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """测试邮箱配置是否正确。
+
+    返回内容包含 SMTP 主机 / 端口 / 发件邮箱，属于服务器配置信息，
+    因此只允许超级管理员查看（曾经是无鉴权的，任何人都能从公网读到）。
+    """
+    if not current_user.is_super_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="仅超级管理员可查看邮箱配置"
+        )
+
+    from app.services.email_service import email_service
+
+    config_info = {
+        "configured": email_service.is_configured,
+        "smtp_host": email_service.smtp_host if email_service.is_configured else None,
+        "smtp_port": email_service.smtp_port if email_service.is_configured else None,
+        "smtp_email": email_service.smtp_email if email_service.is_configured else None,
+        "from_name": email_service.from_name if email_service.is_configured else None,
+        "password_set": bool(email_service.smtp_password) if email_service.is_configured else False,
+    }
+
+    return config_info
+
+
+@router.get("/captcha", summary="生成图形验证码")
+async def create_captcha() -> dict[str, str]:
+    """生成新的图形验证码。
+
+    只返回验证码图片（base64 PNG），绝不返回答案文本；
+    旧版把 captcha_text 明文回传给前端绘制，脚本可直接读取答案，验证形同虚设。
+
+    Returns:
+        包含 captcha_id 和 image（data URL）的字典
+    """
+    captcha_text, captcha_image = generate_captcha()
+    captcha_id = generate_captcha_id()
+
+    # 存储验证码，5分钟后过期
+    expiry = datetime.now(UTC) + timedelta(minutes=5)
+    _captcha_store[captcha_id] = {
+        "text": captcha_text,
+        "expiry": expiry
+    }
+
+    # 内存防护：验证码存量过大时清理过期项（接口无需登录，防刷爆内存）
+    if len(_captcha_store) > 500:
+        now = datetime.now(UTC)
+        for cid in [
+            cid for cid, d in _captcha_store.items() if d["expiry"] < now
+        ]:
+            del _captcha_store[cid]
+
+    return {
+        "captcha_id": captcha_id,
+        "image": f"data:image/png;base64,{captcha_image}"
+    }
+
+
+@router.post("/login", response_model=TokenResponse, summary="登录（支持多种标识符）")
+async def login_with_identifier(
+    payload: UserLogin,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> TokenResponse:
+    """使用用户名/UID/手机/邮箱登录。
+
+    Args:
+        payload: 登录数据，包含 identifier、password 和 captcha
+        db: 数据库会话
+
+    Returns:
+        访问令牌和刷新令牌
+
+    Raises:
+        HTTPException: 认证失败时
+    """
+    _check_ip_limit(request, "login", _IP_LIMIT_LOGIN)
+    # 只有显式启用 ESA 强制模式后才信任 captcha_verify_param；
+    # ESA 未启用时，即使客户端伪造此字段，仍必须通过本地图形码。
+    if settings.ESA_CAPTCHA_REQUIRED:
+        if not payload.captcha_verify_param:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="请先完成安全验证",
+            )
+    else:
+        # ESA 尚未配置时保留现有图形验证码，便于零停机准备与本地开发。
+        if not payload.captcha_id or not payload.captcha:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="请提供验证码"
+            )
+
+        captcha_data = _captcha_store.get(payload.captcha_id)
+        if not captcha_data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="验证码已过期或无效"
+            )
+
+        if captcha_data["expiry"] < datetime.now(UTC):
+            del _captcha_store[payload.captcha_id]
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="验证码已过期"
+            )
+
+        if not validate_captcha(payload.captcha, captcha_data["text"]):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="图形验证码错误"
+            )
+
+        del _captcha_store[payload.captcha_id]
+
+    # 根据标识符获取邮箱
+    email = await get_email_by_identifier(db, payload.identifier)
+    if not email:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="用户不存在"
+        )
+
+    # 验证用户凭据
+    user = await auth_service.authenticate_user(db, email, payload.password)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="用户名或密码错误"
+        )
+
+    # 检查封禁状态
+    if await check_user_banned(db, user.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="账号已被封禁，请联系管理员"
+        )
+
+    # 签发令牌
+    access, refresh = await auth_service.issue_token_pair(db, user.id)
+    return TokenResponse(access_token=access, refresh_token=refresh)
+
+
+@router.post("/send-verification", summary="发送邮箱验证码")
+async def send_verification_code(payload: dict[str, str], request: Request) -> dict[str, str]:
+    """发送邮箱验证码。
+
+    Args:
+        payload: 包含email字段的对象
+
+    Returns:
+        发送结果和验证令牌
+    """
+    email = (payload.get("email") or "").strip()
+
+    if not email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="请提供邮箱地址"
+        )
+
+    # 验证邮箱格式
+    email_regex = r"^[^\s@]+@[^\s@]+\.[^\s@]+$"
+    if not re.match(email_regex, email):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="邮箱格式不正确"
+        )
+
+    # 按 IP 限流：同一来源换着邮箱刷发信，会被这里先拦下
+    _check_ip_limit(request, "sendverify", _IP_LIMIT_SEND_VERIFY)
+
+    # 临时邮箱检测：一次性邮箱收码注册即弃，是批量造小号的主要通道；
+    # 放在邮箱冷却之前，避免临时邮箱消耗正常邮箱的冷却/日额度
+    if await _is_disposable_email(email):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="不支持使用临时邮箱注册，请更换常用邮箱"
+        )
+
+    # 限流。放在格式校验之后，免得垃圾请求白占额度。
+    # 顺序也有讲究：先看邮箱自己的冷却，被自己的冷却拦住时不会消耗全站额度。
+    limit_key = email.lower()
+    for key, max_requests, window_seconds, message in (
+        (f"emailverify:addr:{limit_key}", 1, _SEND_EMAIL_COOLDOWN_SECONDS,
+         "验证码刚刚发送过，请 {wait} 秒后再试"),
+        (f"emailverify:addr-day:{limit_key}", settings.EMAIL_SEND_PER_EMAIL_DAY, 86400,
+         "该邮箱今日发送次数已达上限，请明天再试"),
+        ("emailverify:global", settings.EMAIL_SEND_GLOBAL_PER_HOUR, 3600,
+         "系统发信繁忙，请 {wait} 秒后再试"),
+    ):
+        ok, wait = check(key, max_requests, window_seconds)
+        if not ok:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=message.format(wait=wait),
+            )
+
+    try:
+        # 生成验证码和令牌
+        code = generate_verification_code(6)
+        token = generate_email_token(email)
+
+        # 存储验证码（10分钟有效期），绑定收码邮箱
+        stored_token = store_verification_code(token, code, email, expiry_minutes=10)
+
+        # 发送邮件
+        success = await email_service.send_verification_email(email, code, 10)
+
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="发送验证码失败，请稍后重试"
+            )
+
+        return {
+            "message": "验证码已发送到您的邮箱",
+            "token": token,
+            "expiry_minutes": "10"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"发送验证码失败: {str(e)}"
+        )
+
+
+@router.post("/register", response_model=dict, summary="注册新用户")
+async def register_user(
+    payload: UserCreate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """注册新用户（仅支持邮箱注册）。
+
+    Args:
+        payload: 用户注册数据
+        db: 数据库会话
+
+    Returns:
+        创建的用户信息和令牌
+
+    Raises:
+        HTTPException: 注册失败时
+    """
+    _check_ip_limit(request, "register", _IP_LIMIT_REGISTER)
+
+    # 确定注册方式：邮箱注册或手机注册
+    is_email_register = payload.email is not None
+    is_phone_register = payload.phone is not None
+
+    if not is_email_register and not is_phone_register:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="请提供邮箱或手机号进行注册"
+        )
+
+    # 手机注册通道没有短信验证能力，填任意合法手机号即可注册成功，
+    # 等于向脚本开放免验证造号（站点曾遭批量注册攻击）。已焊死。
+    if is_phone_register:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="暂不支持手机号注册，请使用邮箱注册"
+        )
+
+    # 验证邮箱注册
+    if is_email_register:
+        if not payload.email_token or not payload.email_code:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="请提供邮箱验证码"
+            )
+
+        # 验证邮箱验证码：必须与收码邮箱一致，
+        # 否则可用自己邮箱的验证码给任意邮箱注册（等于邮箱验证失效）
+        if not verify_code(payload.email_token, payload.email_code,
+                           expected_email=payload.email):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="邮箱验证码错误或已过期"
+            )
+
+        # 删除已使用的验证码
+        delete_verification_code(payload.email_token)
+
+    # 手机注册无需验证码（直接凭手机号注册），但格式必须合法
+    if is_phone_register and not re.match(r"^1[3-9]\d{9}$", payload.phone or ""):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="手机号格式不正确（须为中国大陆 11 位手机号）"
+        )
+
+    # 手机注册无需验证码（直接凭手机号注册）
+
+    # 检查用户名是否已存在
+    from sqlalchemy import select
+    existing_user = await db.execute(
+        select(User).where(User.username == payload.username)
+    )
+    if existing_user.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="用户名已存在"
+        )
+
+    # 检查邮箱是否已存在
+    if is_email_register:
+        existing_email = await db.execute(
+            select(User).where(User.email == payload.email)
+        )
+        if existing_email.scalar_one_or_none():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="邮箱已被使用"
+            )
+
+    # 检查手机号是否已存在
+    if is_phone_register:
+        existing_phone = await db.execute(
+            select(User).where(User.phone == payload.phone)
+        )
+        if existing_phone.scalar_one_or_none():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="手机号已被使用"
+            )
+
+    # 哈希密码
+    hashed_pwd = hash_password(payload.password)
+
+    # 创建用户（手机注册时生成虚拟邮箱）
+    user_email = payload.email
+    if is_phone_register and not user_email:
+        # 为手机注册用户生成虚拟邮箱
+        user_email = f"phone+{payload.phone}@phone.jason227.cn"
+
+    # 创建用户
+    user = await create_user_with_number(
+        db,
+        username=payload.username,
+        email=user_email,
+        hashed_password=hashed_pwd,
+        phone=payload.phone
+    )
+
+    # 签发令牌
+    access, refresh = await auth_service.issue_token_pair(db, user.id)
+
+    return {
+        "user": {
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "user_number": user.user_number,
+            "phone": user.phone
+        },
+        "tokens": {
+            "access_token": access,
+            "refresh_token": refresh
+        }
+    }
+
+
+def _decode_prefs_template(raw: str | None) -> dict[str, str] | None:
+    """偏好设置的 code_template 列（JSON 字符串）→ 字典；空或脏数据回 None。"""
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+@router.get("/me", summary="获取当前用户详细信息")
+async def get_current_user_info(
+    current_user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """获取当前登录用户的详细信息。
+
+    Args:
+        current_user: 当前用户
+
+    Returns:
+        用户详细信息
+    """
+    return {
+        "id": current_user.id,
+        "username": current_user.username,
+        "email": current_user.email,
+        "user_number": current_user.user_number,
+        "phone": current_user.phone,
+        "is_active": current_user.is_active,
+        "is_banned": current_user.is_banned,
+        "is_admin": current_user.is_admin,
+        "is_super_admin": current_user.is_super_admin,
+        "is_big_admin": current_user.is_big_admin,
+        "is_cheater": current_user.is_cheater,
+        "can_speak": current_user.can_speak,
+        "can_manage_users": current_user.can_manage_users,
+        "can_manage_posts": current_user.can_manage_posts,
+        "can_manage_problems": current_user.can_manage_problems,
+        "can_manage_tags": current_user.can_manage_tags,
+        "tag_cards": [
+            {"id": c.id, "name": c.name, "enabled": c.enabled}
+            for c in current_user.tag_cards
+        ],
+        "can_assign_admin": current_user.can_assign_admin,
+        "experience": current_user.experience,
+        "contribution": current_user.contribution,
+        "theme_background": current_user.theme_background,
+        "theme_enabled": current_user.theme_enabled,
+        "theme_hue": current_user.theme_hue,
+        "theme_mode": current_user.theme_mode,
+        "home_style": current_user.home_style,
+        "academic_mode": current_user.academic_mode,
+        "code_template": _decode_prefs_template(current_user.code_template),
+        "code_font": current_user.code_font,
+        "avatar_url": current_user.avatar_url,
+        "user_tag": current_user.user_tag,
+        "display_tag": current_user.display_tag,
+        "username_color": current_user.username_color,
+        "color_tier": current_user.color_tier,
+        "name_color": current_user.name_color,
+        "color_exp_spent": current_user.color_exp_spent,
+        "bio": current_user.bio,
+        # 在线点要用的字段：前端 currentUser 就是这份数据，
+        # 不返回它，界面上「我自己」的在线状态就永远算不出来
+        "last_seen": current_user.last_seen,
+        "last_username_change": current_user.last_username_change,
+        "created_at": current_user.created_at
+    }
+
+
+@router.post("/password-reset/request", summary="请求密码重置")
+async def request_password_reset(
+    payload: dict[str, str],
+    request: Request,
+    db: AsyncSession = Depends(get_db)
+) -> dict[str, str]:
+    """请求密码重置，发送重置链接到用户邮箱。
+
+    Args:
+        payload: 包含email字段的对象
+        db: 数据库会话
+
+    Returns:
+        发送结果
+
+    Raises:
+        HTTPException: 邮箱不存在或发送失败时
+    """
+    email = payload.get("email")
+
+    if not email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="请提供邮箱地址"
+        )
+
+    # 验证邮箱格式
+    email_regex = r"^[^\s@]+@[^\s@]+\.[^\s@]+$"
+    if not re.match(email_regex, email):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="邮箱格式不正确"
+        )
+
+    # 按 IP 限流：这个接口同样会把邮件真发出去
+    _check_ip_limit(request, "pwdreset", _IP_LIMIT_PWD_RESET)
+
+    # 检查邮箱是否存在于数据库中
+    from sqlalchemy import select
+    existing_user = await db.execute(
+        select(User).where(User.email == email)
+    )
+    user = existing_user.scalar_one_or_none()
+
+    if not user:
+        # 为了安全，不透露邮箱是否存在，但返回成功消息
+        # 在生产环境中，你可能想要记录这个尝试
+        print(f"[Password Reset] 尝试重置不存在的邮箱: {email}")
+        return {
+            "message": "如果该邮箱已注册，您将收到密码重置链接",
+            "expiry_minutes": "30"
+        }
+
+    # 生成重置令牌
+    token = generate_password_reset_token(email)
+    store_password_reset_token(token, email, expiry_minutes=30)
+
+    # 构建重置链接（必须是绝对地址，否则用户点开是 localhost）
+    reset_link = f"{settings.FRONTEND_URL.rstrip('/')}/reset-password?token={token}"
+
+    # 发送邮件
+    success = await email_service.send_password_reset_email(
+        email=email,
+        reset_link=reset_link,
+        expiry_minutes=30
+    )
+
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="发送密码重置邮件失败，请稍后重试"
+        )
+
+    return {
+        "message": "密码重置链接已发送到您的邮箱",
+        "expiry_minutes": "30"
+    }
+
+
+@router.post("/password-reset/confirm", summary="确认密码重置")
+async def confirm_password_reset(
+    payload: dict[str, str],
+    db: AsyncSession = Depends(get_db)
+) -> dict[str, str]:
+    """使用重置令牌确认密码重置。
+
+    Args:
+        payload: 包含token和new_password字段的对象
+        db: 数据库会话
+
+    Returns:
+        重置结果
+
+    Raises:
+        HTTPException: 令牌无效或重置失败时
+    """
+    token = payload.get("token")
+    new_password = payload.get("new_password")
+
+    if not token or not new_password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="请提供重置令牌和新密码"
+        )
+
+    # 验证密码长度
+    if len(new_password) < 6:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="密码长度至少为6位"
+        )
+
+    # 验证重置令牌
+    reset_data = verify_password_reset_token(token)
+    if not reset_data:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="重置令牌无效或已过期"
+        )
+
+    email = reset_data["email"]
+
+    # 查找用户
+    from sqlalchemy import select
+    existing_user = await db.execute(
+        select(User).where(User.email == email)
+    )
+    user = existing_user.scalar_one_or_none()
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="用户不存在"
+        )
+
+    # 哈希新密码
+    hashed_pwd = hash_password(new_password)
+
+    # 更新密码
+    user.hashed_password = hashed_pwd
+    await db.commit()
+
+    # 标记令牌为已使用
+    mark_password_reset_token_used(token)
+
+    print(f"[Password Reset] 用户 {email} 的密码已成功重置")
+
+    return {
+        "message": "密码重置成功，请使用新密码登录"
+    }
+
+
+@router.post("/change-email/send-code", summary="发送更换邮箱验证码")
+async def send_change_email_code(
+    payload: dict[str, str],
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict[str, str]:
+    """向新邮箱发送验证码，用于更换绑定邮箱。"""
+    new_email = (payload.get("email") or "").strip()
+
+    if not new_email:
+        raise HTTPException(status_code=400, detail="请提供新邮箱地址")
+
+    if not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", new_email):
+        raise HTTPException(status_code=400, detail="邮箱格式不正确")
+
+    if new_email.lower() == current_user.email.lower():
+        raise HTTPException(status_code=400, detail="新邮箱与当前邮箱相同")
+
+    # 检查新邮箱是否已被其他用户占用
+    from sqlalchemy import select
+    exists = (await db.execute(
+        select(User.id).where(User.email == new_email)
+    )).scalar_one_or_none()
+    if exists is not None:
+        raise HTTPException(status_code=409, detail="该邮箱已被其他账号使用")
+
+    # 限流
+    _check_ip_limit(request, "sendverify", _IP_LIMIT_SEND_VERIFY)
+    limit_key = new_email.lower()
+    for key, max_requests, window_seconds, message in (
+        (f"emailverify:addr:{limit_key}", 1, _SEND_EMAIL_COOLDOWN_SECONDS,
+         "验证码刚刚发送过，请 {wait} 秒后再试"),
+        (f"emailverify:addr-day:{limit_key}", settings.EMAIL_SEND_PER_EMAIL_DAY, 86400,
+         "该邮箱今日发送次数已达上限，请明天再试"),
+        ("emailverify:global", settings.EMAIL_SEND_GLOBAL_PER_HOUR, 3600,
+         "系统发信繁忙，请 {wait} 秒后再试"),
+    ):
+        ok, wait = check(key, max_requests, window_seconds)
+        if not ok:
+            raise HTTPException(status_code=429, detail=message.format(wait=wait))
+
+    try:
+        code = generate_verification_code(6)
+        token = generate_email_token(new_email)
+        store_verification_code(token, code, new_email, expiry_minutes=10)
+        success = await email_service.send_verification_email(new_email, code, 10)
+        if not success:
+            raise HTTPException(status_code=500, detail="发送验证码失败，请稍后重试")
+        return {"message": "验证码已发送到新邮箱", "token": token, "expiry_minutes": "10"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"发送验证码失败: {str(e)}")
+
+
+@router.post("/change-email/confirm", summary="确认更换邮箱")
+async def confirm_change_email(
+    payload: dict[str, str],
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """使用验证码确认更换邮箱。"""
+    token = payload.get("token")
+    code = payload.get("code")
+
+    if not token or not code:
+        raise HTTPException(status_code=400, detail="请提供验证码和令牌")
+
+    # 先取出关联邮箱（verify_code 成功后会删除存储）
+    new_email = get_verification_email(token)
+    if not new_email:
+        raise HTTPException(status_code=400, detail="验证码令牌无效或已过期")
+
+    if not verify_code(token, code):
+        raise HTTPException(status_code=400, detail="验证码错误或已过期")
+
+    # 再次确认邮箱未被占用（发送后到确认前可能被注册）
+    from sqlalchemy import select
+    exists = (await db.execute(
+        select(User.id).where(User.email == new_email)
+    )).scalar_one_or_none()
+    if exists is not None and exists != current_user.id:
+        raise HTTPException(status_code=409, detail="该邮箱已被其他账号使用")
+
+    current_user.email = new_email
+    await db.commit()
+
+    return {"message": "邮箱更换成功", "email": new_email}
+

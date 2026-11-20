@@ -1,0 +1,326 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+
+:root {
+  /* 显式声明浅色方案：light-dark() 与原生控件的浅色半边靠它解析
+     （html[data-theme="dark"] 上的 color-scheme: dark 特异性更高，深色时翻转） */
+  color-scheme: light;
+
+  /* ===== 色相调整（主题商店）=====
+     --hue-shift 由 App.vue 按用户 theme_hue 写入（-180..180 度，0 = 默认）。
+     彩色设计令牌全部用 calc(基准色相 + var(--hue-shift)) 派生：改这一个
+     变量，主题色/光斑背景/装饰渐变全站重算；Logo 的 <img> 内 svg 不吃
+     CSS 变量，靠 filter: hue-rotate 跟同一变量（App.vue 全局规则）。
+     基准 HSL 与原 hex 逐位换算，shift=0 时外观零变化；
+     语义色（success/danger/warning）与中性色不参与旋转。 */
+  --hue-shift: 0;
+
+  /*
+  --primary: #2a8eff;
+  --primary-hover: #1a7ae0;
+  */
+  /* 原 #4a4ae0（hsl 240 70.75% 58.43%），注释掉的 #5a5aff 降明度而来 */
+  --primary: hsla(calc(240 + var(--hue-shift)), 70.75%, 58.43%, 1);
+  --primary-hover: hsla(calc(240 + var(--hue-shift)), 53.6%, 49.02%, 1);
+  --accent: hsla(calc(268.07 + var(--hue-shift)), 100%, 63.53%, 1); /* 原 #9c45ff 紫，点缀/渐变 */
+  --success: #10b981;         /* AC 绿 */
+  --danger: #ef4444;          /* WA 红 */
+  --warning: #f59e0b;         /* TLE 橙 */
+
+  /* 装饰渐变尾色（NLNOC 头像条/发送按钮等），与主题色同步旋转 */
+  --grad-violet: hsla(calc(251.78 + var(--hue-shift)), 100%, 68.04%, 1); /* 原 7c5cff 调 */
+  --grad-indigo: hsla(calc(246 + var(--hue-shift)), 75.27%, 63.53%, 1);  /* 原 6a5ce8 调 */
+  --grad-sky: hsla(calc(198.4 + var(--hue-shift)), 93.2%, 59.61%, 1);    /* 原 38bdf8 调 */
+
+  /* ===== 设计令牌：统一改这里，别在组件里写死 ===== */
+
+  /* 等宽字体（偏好设置）：--font-mono 由 App.vue 按用户 code_font 写入，
+     code/pre/kbd/samp 与代码编辑器（CodeEditor）共用；null/未设置 = 默认 JetBrains Mono */
+  --font-mono: "JetBrains Mono", "Fira Code", Consolas, Monaco, monospace;
+
+  /* 页面背景：整体提亮，底色叠淡蓝紫光斑（亚克力卡片需要有色彩可透）。
+     这三层光斑 + 底色就是「未设置主题时的初始背景」，随色相一起变 */
+  --bg-page: hsla(calc(221.93 + var(--hue-shift)), 71.4%, 97.25%, 1);              /* 原 #f3f6fd */
+  --bg-page-glow-1: hsla(calc(232.78 + var(--hue-shift)), 100%, 73.92%, 0.16);     /* 原 rgba(122,138,255,.16) */
+  --bg-page-glow-2: hsla(calc(268.07 + var(--hue-shift)), 100%, 63.53%, 0.10);     /* 原 rgba(156,69,255,.10)，即 accent */
+  --glow-blue: hsla(calc(211.83 + var(--hue-shift)), 100%, 58.24%, 1);             /* 蓝光基础色（原 42,142,255 系） */
+  --bg-page-glow-3: color-mix(in srgb, var(--glow-blue) 10%, transparent);
+
+  /* 卡片表面：半透明亚克力 */
+  --surface: rgba(255, 255, 255, 0.62);
+  --surface-strong: rgba(255, 255, 255, 0.78);   /* 导航栏等需要更实的场合 */
+  --surface-blur: 16px;
+
+  /* 边框：浅灰细边 */
+  --border-color: rgba(148, 163, 184, 0.38);
+  --border-width: 1px;
+
+  /* 圆角：全站加大 */
+  --radius-lg: 20px;
+  --radius-md: 14px;
+  --radius-sm: 10px;
+
+  /* 阴影 */
+  --shadow-card: 0 4px 24px rgba(31, 41, 85, 0.07);
+  --shadow-card-hover: 0 8px 32px rgba(31, 41, 85, 0.12);
+
+  /* 文本 */
+  --text-main: #2c3e50;
+  --text-sub: #8e9aaf;
+
+  /* 中性表面与强调字：硬编码白底/浅灰底/深色字的收编目标。
+     深色主题只翻转 html[data-theme="dark"] 里这几个值，
+     组件里凡是用了 var() 的地方自动跟随，不用逐组件写暗色规则。 */
+  --surface-plain: #ffffff;   /* 纯白块：独立小卡片、输入框、表格底 */
+  --bg-subtle: #f2f4f7;       /* 次级浅灰块：块中块、悬浮底、占位区 */
+  --text-strong: #2c3e50;     /* 强调深字：标题、加粗、表头（深色下反转为更亮一档） */
+
+  /* 语义文字（告警条/徽标等语义浅底上的文字）：
+     浅色下用「深语义色」压在浅底上（保原设计的 4.5:1+），
+     深色下翻转为亮语义色压在暗 tint 上 —— 两边都靠这一对令牌翻转，
+     底（color-mix 语义色 10%）与字始终同族同向。 */
+  --danger-text: #b91c1c;
+  --warning-text: #b45309;
+  --success-text: #047857;
+  --primary-text: #1d4ed8;
+  --accent-text: #7e22ce;
+}
+
+/* ===== 深色主题（主题商店「深色主题」开关）=====
+   html[data-theme="dark"] 由 App.vue 按用户 theme_mode 挂在 <html> 上，
+   main.ts 启动时先按 localStorage 记忆应用一次，避免刷新时浅→深跳变。
+
+   设计取向（刻意避开深色主题的两个常见误区 —— 对比度过高、画面太暗）：
+   - 底色不是纯黑：约 14% 亮度的蓝灰，与浅色主题同色温，光斑保留微光；
+   - 正文不是纯白：约 78% 的柔和银灰，正文对比控制在 ~7:1 内（远低于
+     纯黑配纯白的 21:1），次要文字约 50% 亮度维持 4.5:1 以上；
+   - 彩色令牌保持品牌色相（仍吃 --hue-shift），只微调明暗去电光感；
+   - 语义色（AC 绿/失败红/警告橙）是小面积文字徽标，暗底上稍提亮保可读；
+   - 卡片是半透明深灰亚克力，阴影加深靠层次而非描边提亮。
+   与 theme_hue 同机制：整站翻转只动这一块，组件零改动。 */
+html[data-theme="dark"] {
+  /* 让浏览器原生控件（checkbox、input 光标、select 弹层、表单高亮）
+     一并切到深色方案，不用逐个控件写暗色样式 */
+  color-scheme: dark;
+
+  /* 页面底：蓝灰深色（222° 与浅色底同色温），14% 亮度不发闷 */
+  --bg-page: hsla(calc(221.93 + var(--hue-shift)), 24%, 14%, 1);
+  /* 光斑降明度、降透明度：只留一点氛围，不跟内容抢注意力 */
+  --bg-page-glow-1: hsla(calc(232.78 + var(--hue-shift)), 80%, 44%, 0.13);
+  --bg-page-glow-2: hsla(calc(268.07 + var(--hue-shift)), 80%, 50%, 0.10);
+  --glow-blue: hsla(calc(211.83 + var(--hue-shift)), 90%, 54%, 1);
+  --bg-page-glow-3: color-mix(in srgb, var(--glow-blue) 7%, transparent);
+
+  /* 亚克力卡片：深灰半透明（.card 基类的 blur/saturate 沿用不变） */
+  --surface: rgba(38, 42, 51, 0.62);
+  --surface-strong: rgba(44, 49, 59, 0.78);
+
+  /* 暗底边框比浅色下更淡：亮描边在暗底上会「发光」 */
+  --border-color: rgba(148, 163, 184, 0.16);
+
+  /* 深色下阴影是主要的层次手段，比浅色下更深 */
+  --shadow-card: 0 4px 24px rgba(0, 0, 0, 0.35);
+  --shadow-card-hover: 0 8px 32px rgba(0, 0, 0, 0.45);
+
+  /* 文本：柔和银灰（非纯白），次要文字中灰蓝 */
+  --text-main: #c6ccd6;
+  --text-sub: #8a93a3;
+
+  /* 中性表面与强调字的暗色面：白块变深灰块、浅灰块再深一档、
+     深字反转为比正文更亮一档（保持「强调」的层次方向） */
+  --surface-plain: #262b33;
+  --bg-subtle: #2c313b;
+  --text-strong: #d5dae2;
+
+  /* 主色：同色相（仍随 --hue-shift 旋转），明度 +3、饱和 -6 去电光感；
+     hover 在暗底上「变亮」（浅色主题是变暗） */
+  --primary: hsla(calc(240 + var(--hue-shift)), 64%, 61%, 1);
+  --primary-hover: hsla(calc(240 + var(--hue-shift)), 60%, 67%, 1);
+  /* 点缀紫：饱和略降，避免暗底上过亮 */
+  --accent: hsla(calc(268.07 + var(--hue-shift)), 92%, 66%, 1);
+
+  /* 语义色：小面积文字/徽标，暗底提亮保证可读（浅色下原值偏暗会看不清） */
+  --success: #34d399;
+  --danger: #f87171;
+  --warning: #fbbf24;
+
+  /* 语义文字：暗色下翻转为亮语义色（压在暗 tint 徽标底上） */
+  --danger-text: var(--danger);
+  --warning-text: var(--warning);
+  --success-text: var(--success);
+  --primary-text: var(--primary);
+  --accent-text: var(--accent);
+}
+
+/* ===== 全局卡片基类：半透明亚克力 + 浅灰细边 + 大圆角 =====
+   页面里自己的 .card 若还写 background/border-radius 会盖掉这里，
+   新代码直接用基类，老样式建议逐步删掉本地硬编码。 */
+.card {
+  background: var(--surface);
+  -webkit-backdrop-filter: blur(var(--surface-blur)) saturate(1.5);
+  backdrop-filter: blur(var(--surface-blur)) saturate(1.5);
+  border: var(--border-width) solid var(--border-color);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+}
+
+/* 加载态容器：spinner + 文案，各列表页统一复用 */
+.loading-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 52px 0;
+  color: var(--text-sub);
+  font-size: 13px;
+}
+
+.loading-state .loading-spinner {
+  width: 20px;
+  height: 20px;
+}
+
+/* ===== 主题模式（自定义背景启用）=====
+   这里原本有一组规则：悬停哪张卡片，哪张就把背景从 --surface(0.62)
+   提亮到 0.94 变白，方便在背景图上阅读。实际效果是悬停前后背景
+   透明度跳变太明显，已按需求去掉 —— 现在卡片悬停与一般状态无差别。
+   #app.theme-on 类仍由 App.vue 挂着，留给主题模式做差异化样式用。 */
+
+body {
+  margin: 0;
+  font-family: "Google Sans Flax", "Noto Sans SC", system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#app {
+  min-height: 100vh;
+}
+
+/* ===== 滚动条 =====
+   桌面端显示细滚动条（webkit 视觉样式在 App.vue 全局块：8px 灰色 thumb），
+   scrollbar-color 与之对齐给 Firefox 等标准实现；
+   移动端（≤768px）隐藏 —— 触屏用不到，还白占一条内容宽度。 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #c1c1c1 #f1f1f1;
+}
+
+@media (max-width: 768px) {
+  ::-webkit-scrollbar {
+    display: none;
+  }
+
+  * {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+}
+
+/* 深色下的滚动条：thumb 提到中灰、轨道压到近底色（特异性高于
+   App.vue 的浅色 webkit 规则，与顺序无关） */
+html[data-theme="dark"] * {
+  scrollbar-color: #4b515d #22262d;
+}
+html[data-theme="dark"] ::-webkit-scrollbar-track {
+  background: #22262d;
+}
+html[data-theme="dark"] ::-webkit-scrollbar-thumb {
+  background: #4b515d;
+}
+html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover {
+  background: #5b626f;
+}
+
+/* ===== 深色下的原生控件兜底 =====
+   用 :where() 把特异性压到 0：只给没写样式的元素兜底
+   （浏览器默认白底 input 在暗底上会发光），组件自己的规则照常覆盖。 */
+:where(html[data-theme="dark"]) {
+  color: var(--text-main);
+}
+:where(html[data-theme="dark"]) input,
+:where(html[data-theme="dark"]) textarea,
+:where(html[data-theme="dark"]) select {
+  background-color: var(--surface-plain);
+  color: var(--text-main);
+  border-color: var(--border-color);
+}
+:where(html[data-theme="dark"]) input::placeholder,
+:where(html[data-theme="dark"]) textarea::placeholder {
+  color: var(--text-sub);
+}
+:where(html[data-theme="dark"]) hr {
+  border-color: var(--border-color);
+}
+html[data-theme="dark"] ::selection {
+  background: rgba(94, 124, 255, 0.32);
+}
+
+/* SweetAlert2 跟随深色（组件里自定义过的 swal 规则特异性更高，仍可覆盖） */
+html[data-theme="dark"] .swal2-popup {
+  background: var(--surface-plain);
+  color: var(--text-main);
+}
+html[data-theme="dark"] .swal2-title {
+  color: var(--text-main);
+}
+html[data-theme="dark"] .swal2-html-container {
+  color: var(--text-sub);
+}
+html[data-theme="dark"] .swal2-input,
+html[data-theme="dark"] .swal2-textarea,
+html[data-theme="dark"] .swal2-select {
+  background: var(--bg-subtle);
+  color: var(--text-main);
+  border-color: var(--border-color);
+}
+html[data-theme="dark"] .swal2-input::placeholder,
+html[data-theme="dark"] .swal2-textarea::placeholder {
+  color: var(--text-sub);
+}
+html[data-theme="dark"] .swal2-confirm,
+html[data-theme="dark"] .swal2-cancel,
+html[data-theme="dark"] .swal2-styled {
+  box-shadow: none;
+}
+
+body {
+  font-family: "Lato", "Noto Sans SC", system-ui, -apple-system, sans-serif;
+}
+
+/* 正文统一使用无衬线字体。
+   注意排除列表：代码编辑器整棵子树（.cm-editor）与高亮后的代码 token（.hljs）
+   都必须排除 —— 它们不是 code/pre 元素，漏掉就会被强制套上正文字体。
+   （highlight.js 生成的 <span class="hljs-*"> 曾因此变成无衬线字体） */
+body *:not(i):not(.fa):not(.fas):not(.far):not(.fab):not(.fa-solid):not(.fa-regular):not(.fa-brands):not(.cm-editor):not(.cm-editor *):not(.hljs):not(.hljs *):not(code):not(pre):not(kbd):not(samp):not(.katex):not(.katex *) {
+  font-family: "Lato", "Noto Sans SC", system-ui, -apple-system, sans-serif;
+}
+
+code, pre, kbd, samp {
+  font-family: var(--font-mono);
+}
+
+.katex, .katex-display, .katex * {
+  font-family: KaTeX_Main, "Times New Roman", serif;
+}
+
+/* ===== 学术模式：题目难度的「展开」按钮 =====
+   题库列表、题面页、题单页三处共用。原先各组件各抄一份 scoped 样式，
+   改一处忘两处，所以收到这里；按题展开的交互逻辑见 utils/academicMode.ts。 */
+.diff-reveal-btn {
+  padding: 2px 10px;
+  border: 1px dashed #cbd5e1;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-sub);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.diff-reveal-btn:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}

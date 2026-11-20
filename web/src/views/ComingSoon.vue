@@ -1,0 +1,113 @@
+<script setup lang="ts">
+import { computed } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+
+const route = useRoute()
+const router = useRouter()
+
+const path = computed(() => route.path)
+</script>
+
+<template>
+  <div class="coming-soon-page">
+    <div class="soon-card">
+      <div class="soon-icon"><i class="fa-solid fa-person-digging"></i></div>
+      <h2 class="soon-title">本功能暂未开放</h2>
+      <p class="soon-sub">该功能正在开发中，敬请期待</p>
+      <p class="soon-path">当前路径：{{ path }}</p>
+      <div class="soon-actions">
+        <button class="btn-home" @click="router.push('/')">返回主页</button>
+        <button class="btn-back" @click="router.back()">返回上一页</button>
+      </div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.coming-soon-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1.6;
+}
+
+.soon-card {
+  background: var(--surface-plain);
+  border-radius: 16px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
+  padding: 48px 60px;
+  text-align: center;
+  max-width: 460px;
+  width: 90%;
+}
+
+.soon-icon {
+  font-size: 52px;
+  margin-bottom: 14px;
+}
+
+.soon-title {
+  font-size: 1.3rem;
+  font-weight: 700;
+  color: var(--text-strong);
+  margin: 0 0 8px;
+}
+
+.soon-sub {
+  color: var(--text-sub);
+  font-size: 14px;
+  margin: 0 0 6px;
+}
+
+.soon-path {
+  color: #c0c8d0;
+  font-size: 12px;
+  margin: 0 0 22px;
+  word-break: break-all;
+}
+
+.soon-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+}
+
+.btn-home {
+  padding: 9px 26px;
+  background: var(--primary);
+  color: #fff;
+  border: none;
+  border-radius: 22px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.btn-home:hover {
+  background: var(--primary-hover);
+}
+
+.btn-back {
+  padding: 9px 26px;
+  background: var(--bg-subtle);
+  color: var(--text-sub);
+  border: none;
+  border-radius: 22px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.btn-back:hover {
+  background: #e5e7eb;
+}
+
+/* ===== 手机端：原本 48px 60px 的内边距在 375px 屏上占掉一半宽度。
+   这个组件是 404 兑底路由 + 9 个未开放入口，影响面比看上去大。===== */
+@media (max-width: 600px) {
+  .soon-card {
+    padding: 32px 20px;
+    width: 100%;
+  }
+}
+</style>

@@ -1,0 +1,40 @@
+<svg width="80" height="80" viewBox="0 0 80 80" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g1" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#5a5aff"/>
+      <stop offset="100%" stop-color="#3a3ac0"/>
+    </linearGradient>
+    <linearGradient id="g2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7a7aff"/>
+      <stop offset="100%" stop-color="#4a4ae0"/>
+    </linearGradient>
+    <linearGradient id="g3" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#9a9aff"/>
+      <stop offset="100%" stop-color="#6a6aff"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 底层（撑满，旋转 -15°） -->
+  <rect x="10" y="10" width="60" height="60" rx="8"
+        fill="url(#g3)" fill-opacity="0.4"
+        transform="rotate(-15 40 40)"/>
+
+  <!-- 中层（旋转 10°） -->
+  <rect x="13" y="13" width="54" height="54" rx="7"
+        fill="url(#g2)" fill-opacity="0.7"
+        transform="rotate(10 40 40)"/>
+
+  <!-- 顶层（旋转 -5°） -->
+  <rect x="16" y="16" width="48" height="48" rx="6"
+        fill="url(#g1)" fill-opacity="1"
+        transform="rotate(-5 40 40)"/>
+
+  <!-- 百分号 % -->
+  <g transform="rotate(-5 40 40)">
+    <circle cx="30" cy="30" r="4" fill="white" fill-opacity="0.95"/>
+    <circle cx="50" cy="50" r="4" fill="white" fill-opacity="0.95"/>
+    <line x1="52" y1="28" x2="28" y2="52"
+          stroke="white" stroke-width="3.5" stroke-linecap="round"
+          stroke-opacity="0.95"/>
+  </g>
+</svg>

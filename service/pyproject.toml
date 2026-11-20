@@ -1,0 +1,37 @@
+[project]
+name = "oj-service"
+version = "0.1.0"
+description = "Online judge backend service (FastAPI)."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "aiosqlite>=0.22.1",
+    "alembic>=1.18.5",
+    "asyncpg>=0.31.0",
+    "bcrypt>=5.0.0",
+    "email-validator>=2.3.0",
+    "fastapi>=0.140.0",
+    "httpx>=0.28.1",
+    "pillow>=11.0.0",
+    "pydantic-settings>=2.14.2",
+    "pyjwt>=2.13.0",
+    # 题目 Markdown 题面解析的 YAML Front Matter 依赖。
+    # 缺失时 problem_markdown 会静默跳过 front matter（title/difficulty 全为 None）。
+    "pyyaml>=6.0.2",
+    "python-multipart>=0.0.32",
+    "sqlalchemy[asyncio]>=2.0.51",
+    "uvicorn[standard]>=0.51.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# 让 `uv run pytest` 也能直接导入 app 包（否则只有 `python -m pytest` 才有 CWD 在 sys.path）
+pythonpath = ["."]
